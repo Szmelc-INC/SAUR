@@ -65,19 +65,18 @@ jobs:
         if: env.PUBLISH == 'true' && steps.run.outputs.changed == 'true'
         run: bin/saur release push
 
-      - name: Commit state
+      # Build state lives in the release (saur-state.tsv), never in git: a nightly state
+      # commit would move this repo's HEAD and make SAUR rebuild itself every night.
+      # Scheduled workflows stop after 60 days without repo activity, hence a rare heartbeat.
+      - name: Heartbeat
         if: env.PUBLISH == 'true'
         run: |
-          git config user.name 'saur-bot'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          # Scheduled workflows stop after 60 days without repo activity: keep a heartbeat.
           if (( $(date +%s) - $(git log -1 --format=%ct) > 45 * 86400 )); then
-            date -u +%FT%TZ > state/heartbeat
-          fi
-          git add state
-          if ! git diff --cached --quiet; then
-            git commit -m "state: $(date -u +%F)"
-            git pull --rebase -q
+            git config user.name 'saur-bot'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            date -u +%FT%TZ > .github/heartbeat
+            git add .github/heartbeat
+            git commit -m "heartbeat: keep the nightly schedule alive"
             git push
           fi
 

@@ -41,7 +41,7 @@ nightly cron / push / manual / repository_dispatch
         │
         ▼
  list every repo in Szmelc-INC  +  repos.extra  −  repos.ignore
-        │   git ls-remote: compare HEAD with state/x86_64.tsv
+        │   git ls-remote: compare HEAD with saur-state.tsv (kept in the release, not in git)
         ▼
  changed repo → blobless clone → every file named PKGBUILD
         │   makepkg inside the PKGBUILD's own directory (local .install files work)

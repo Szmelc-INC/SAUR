@@ -373,9 +373,11 @@ in_container() {
   # SAUR_ENGINE may carry a prefix, e.g. "pkexec docker" when not in the docker group.
   local -a engine
   read -ra engine <<<"$(container_engine)"
-  local -a envs=() vars=("${CONFIG_VARS[@]}" GH_TOKEN GITHUB_TOKEN NO_COLOR SAUR_NO_COLOR)
+  local -a envs=() vars=("${CONFIG_VARS[@]}" NO_COLOR SAUR_NO_COLOR)
   local v
   for v in "${vars[@]}"; do [[ -n ${!v:-} ]] && envs+=(-e "$v=${!v}"); done
+  # Tokens by name only, so they never show up in the process list.
+  for v in GH_TOKEN GITHUB_TOKEN; do [[ -n ${!v:-} ]] && envs+=(-e "$v"); done
   for v in "$WORK" "$OUT" "$STATEDIR"; do
     [[ $v == "$SAUR_HOME"/* ]] || die "$v must live inside SAUR_HOME ($SAUR_HOME) for container builds"
   done
@@ -795,6 +797,9 @@ cmd_release() {
       if ! gh release view "$tag" -R "$repo" >/dev/null 2>&1; then info "no release '$tag' yet, starting empty"; return 0; fi
       step "Downloading release $repo@$tag"
       gh release download "$tag" -R "$repo" -D "$REPODIR" --clobber
+      # Build state rides along as an asset: committing it would move this repo's own
+      # HEAD every night and make SAUR rebuild itself forever.
+      if [[ -f $REPODIR/$NAME-state.tsv ]]; then mkdir -p "$STATEDIR"; mv -f "$REPODIR/$NAME-state.tsv" "$STATE"; fi
       # GitHub stores ':' (epoch) as '.', restore the names pacman expects.
       local fn
       while IFS=$'\t' read -r _ _ _ fn _; do
@@ -822,6 +827,12 @@ cmd_release() {
       local -a dbf=("$REPODIR/$NAME".{db,files}{,.tar.gz})
       for f in "${dbf[@]}"; do local_files[${f##*/}]=1; done
       gh release upload "$tag" -R "$repo" --clobber "${dbf[@]}"
+      if [[ -f $STATE ]]; then
+        local_files[$NAME-state.tsv]=1
+        mkdir -p "$WORK"
+        cp "$STATE" "$WORK/$NAME-state.tsv"
+        gh release upload "$tag" -R "$repo" --clobber "$WORK/$NAME-state.tsv"
+      fi
       for name in "${!remote[@]}"; do
         [[ -n ${local_files[$name]:-} ]] || gh release delete-asset "$tag" "$name" -R "$repo" -y
       done
