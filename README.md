@@ -25,12 +25,12 @@ curl -fsSL https://szmelc-inc.github.io/SAUR/add-ex | sudo bash
 <details>
 <summary>Prefer to do it by hand, or read the script first?</summary>
 
-Trust the signing key. Its fingerprint is `@FPR_PRETTY@`, compare it with the one on [the site](https://szmelc-inc.github.io/SAUR):
+Trust the signing key. Its fingerprint is `C696 31CC 012E 1441 6274 6C48 33AC 2BAB 31E9 EB45`, compare it with the one on [the site](https://szmelc-inc.github.io/SAUR):
 
 ```sh
 curl -fsSLO https://szmelc-inc.github.io/SAUR/key.asc
 sudo pacman-key --add key.asc
-sudo pacman-key --lsign-key @FPR@
+sudo pacman-key --lsign-key C69631CC012E144162746C4833AC2BAB31E9EB45
 ```
 
 Then add this to `/etc/pacman.conf` and run `sudo pacman -Syy`:
@@ -79,7 +79,7 @@ One ed25519 key signs everything SAUR publishes, so there is no doubt what comes
 - both databases, `saur.db` and `saur-ex.db`, and their `.files`,
 - the add scripts and the package lists: `add.asc`, `add-ex.asc`, `packages.json.asc`, `packages.txt.asc`.
 
-Fingerprint: **`@FPR_PRETTY@`**. The public key is [`keys/saur.asc`](keys/saur.asc) in this repo and [`key.asc`](https://szmelc-inc.github.io/SAUR/key.asc) on the site. The add script carries it inline, imports it into pacman's keyring and signs it locally (`pacman-key --lsign-key`), so pacman trusts it for SAUR and the key gets no other power. `SigLevel = Required` then makes pacman refuse an unsigned or modified package or database from any mirror.
+Fingerprint: **`C696 31CC 012E 1441 6274 6C48 33AC 2BAB 31E9 EB45`**. The public key is [`keys/saur.asc`](keys/saur.asc) in this repo and [`key.asc`](https://szmelc-inc.github.io/SAUR/key.asc) on the site. The add script carries it inline, imports it into pacman's keyring and signs it locally (`pacman-key --lsign-key`), so pacman trusts it for SAUR and the key gets no other power. `SigLevel = Required` then makes pacman refuse an unsigned or modified package or database from any mirror.
 
 What a signature proves: the file was built and published by SAUR's own pipeline from Szmelc.INC sources (or `repos.extra`). The secret key lives only in the repo's Actions secret `SAUR_GPG_KEY` and the maintainer's keyring. `bin/saur` takes it out of the environment before any build starts, and PKGBUILD build functions run as an unprivileged user that cannot reach it. Install scripts of build dependencies (which may come from SAUR itself) do run as root in the same container, so push access to a Szmelc-INC repo is, in effect, signing access: guard it like the key. On `main` a run without the key fails instead of publishing unsigned files, and `saur release push` refuses anything that `saur verify` would not pass.
 
