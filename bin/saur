@@ -1206,23 +1206,27 @@ want=("$name")
 ((ex)) && want+=("$exname")
 added=() updated=()
 backup() { [[ -f $conf.saur.bak && ${#added[@]}${#updated[@]} != 00 ]] || cp "$conf" "$conf.saur.bak"; }
-for r in "${want[@]}"; do
-  if grep -q "^\[$r\]" "$conf"; then
+for repo in "${want[@]}"; do
+  if grep -q "^\[$repo\]" "$conf"; then
     # Already there: make its SigLevel what the repository needs now.
-    new=$(awk -v sec="[$r]" -v lvl="SigLevel = $siglevel" '
+    new=$(awk -v sec="[$repo]" -v lvl="SigLevel = $siglevel" '
       $0 == sec { print; print lvl; in_sec = 1; next }
       /^\[/ { in_sec = 0 }
       in_sec && /^[[:space:]]*SigLevel[[:space:]]*=/ { next }
       { print }' "$conf")
-    if [[ $new != "$(<"$conf")" ]]; then backup; printf '%s\n' "$new" >"$conf"; updated+=("$r"); fi
+    if [[ $new != "$(<"$conf")" ]]; then backup; printf '%s\n' "$new" >"$conf"; updated+=("$repo"); fi
     continue
   fi
   backup
   label=stable
-  [[ $r == "$exname" ]] && label='experimental: side branches and work in progress, packages end in -ex'
-  printf '\n# Szmelc AUR (%s): %s\n[%s]\nSigLevel = %s\n%s\n' "$label" "$url" "$r" "$siglevel" "$servers" >>"$conf"
-  added+=("$r")
+  [[ $repo == "$exname" ]] && label='experimental: side branches and work in progress, packages end in -ex'
+  printf '\n# Szmelc AUR (%s): %s\n[%s]\nSigLevel = %s\n%s\n' "$label" "$url" "$repo" "$siglevel" "$servers" >>"$conf"
+  added+=("$repo")
 done
+# Old copies of these databases were synced without signatures; pacman would complain
+# about them before refreshing. -Syy below fetches them again, signed.
+dbpath=$(pacman-conf DBPath 2>/dev/null || echo /var/lib/pacman/)
+for repo in "${added[@]}" "${updated[@]}"; do rm -f "${dbpath%/}/sync/$repo".{db,files}{,.sig}; done
 pretty=$(sed -E 's/(.{4})/\1 /g; s/ $//' <<<"$fpr")
 if ((${#added[@]} == 0)); then
   if ((${#updated[@]})); then
