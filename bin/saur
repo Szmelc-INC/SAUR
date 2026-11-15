@@ -410,11 +410,6 @@ if [[ ${SAUR_CHANNEL:-} == experimental && ${_saur_ex_rename:-1} != 0 ]]; then
       mv "$f" "$f$s"
       renamed+=("$n")
     done
-    for f in "$pkgdir"/usr/bin/*; do # relative symlinks between renamed commands
-      [[ -L $f ]] || continue
-      t=$(readlink "$f")
-      if [[ $t != */* && -e $pkgdir/usr/bin/$t$s ]]; then ln -sfn "$t$s" "$f"; fi
-    done
     for f in "$pkgdir"/usr/share/man/man*/* "$pkgdir"/usr/share/man/*/man*/*; do
       [[ -e $f || -L $f ]] || continue
       n=${f##*/}
@@ -424,19 +419,20 @@ if [[ ${SAUR_CHANNEL:-} == experimental && ${_saur_ex_rename:-1} != 0 ]]; then
     for c in "${renamed[@]}"; do
       re=$(_saur_re "$c")
       f=$pkgdir/usr/share/bash-completion/completions/$c
-      if [[ -f $f ]]; then
+      # Symlinked completions (aliases) are moved too; only real files are edited.
+      if [[ -f $f || -L $f ]]; then
         mv "$f" "$f$s"
-        sed -i -E "/complete /s/([[:space:]])$re([[:space:]]|\$)/\1$c$s\2/g" "$f$s"
+        [[ -L $f$s ]] || sed -i -E "/complete /s/([[:space:]])$re([[:space:]]|\$)/\1$c$s\2/g" "$f$s"
       fi
       f=$pkgdir/usr/share/zsh/site-functions/_$c
-      if [[ -f $f ]]; then
+      if [[ -f $f || -L $f ]]; then
         mv "$f" "${f%/*}/_$c$s"
-        sed -i -E "/^#compdef|compdef /s/([[:space:]])$re([[:space:]]|\$)/\1$c$s\2/g" "${f%/*}/_$c$s"
+        [[ -L ${f%/*}/_$c$s ]] || sed -i -E "/^#compdef|compdef /s/([[:space:]])$re([[:space:]]|\$)/\1$c$s\2/g" "${f%/*}/_$c$s"
       fi
       for f in "$pkgdir"/usr/share/fish/{vendor_completions.d,completions}/"$c".fish; do
-        [[ -f $f ]] || continue
+        [[ -f $f || -L $f ]] || continue
         mv "$f" "${f%/*}/$c$s.fish"
-        sed -i -E "s/(-c|--command)([[:space:]]+)$re([[:space:]]|\$)/\1\2$c$s\3/g" "${f%/*}/$c$s.fish"
+        [[ -L ${f%/*}/$c$s.fish ]] || sed -i -E "s/(-c|--command)([[:space:]]+)$re([[:space:]]|\$)/\1\2$c$s\3/g" "${f%/*}/$c$s.fish"
       done
     done
     for f in "$pkgdir"/usr/share/applications/*.desktop; do
@@ -448,6 +444,37 @@ if [[ ${SAUR_CHANNEL:-} == experimental && ${_saur_ex_rename:-1} != 0 ]]; then
       sed -i -E 's/^Name=(.*)$/Name=\1 (experimental)/' "$f"
       mv "$f" "${f%.desktop}$s.desktop"
     done
+    # Licenses and docs are never read at runtime: give them the package's new name.
+    for f in "$pkgdir"/usr/share/licenses/* "$pkgdir"/usr/share/doc/*; do
+      [[ -e $f || -L $f ]] || continue
+      [[ $f == *"$s" ]] || mv "$f" "$f$s"
+    done
+    # Relative symlinks whose target got renamed above (foo -> foo-ex, x.fish -> x-ex.fish).
+    while IFS= read -r -d '' f; do
+      t=$(readlink "$f")
+      [[ $t == */* || -e ${f%/*}/$t ]] && continue
+      if [[ -e ${f%/*}/$t$s ]]; then ln -sfn "$t$s" "$f"
+      elif [[ $t == *.* && -e ${f%/*}/${t%.*}$s.${t##*.} ]]; then ln -sfn "${t%.*}$s.${t##*.}" "$f"
+      fi
+    done < <(find "$pkgdir" -type l -print0)
+    # Relations inherited from the PKGBUILD would tie foo-ex back to foo: a -git package's
+    # provides=(foo) conflicts=(foo) clashes with the stable build, and replaces= would make
+    # pacman -Syu swap the stable package for the experimental one. Point them at -ex names.
+    local -A own=()
+    for n in "${_saur_names[@]}" ${_saur_base:+"$_saur_base"} "${renamed[@]}"; do
+      own[$n]=1 own[${n%-git}]=1 own[${n%-bin}]=1 own[${n%-nightly}]=1 own[${n%-devel}]=1
+    done
+    _saur_sfx_rel() {
+      local -n _arr=$1
+      local i e nm
+      for i in "${!_arr[@]}"; do
+        e=${_arr[$i]} nm=${_arr[$i]%%[<>=]*}
+        if [[ -n ${own[$nm]:-} ]]; then _arr[$i]=$nm$s${e#"$nm"}; fi
+      done
+    }
+    _saur_sfx_rel provides
+    _saur_sfx_rel conflicts
+    replaces=()
     if [[ -s ${SAUR_STABLE_FILES:-} ]]; then
       mapfile -t hit < <(cd "$pkgdir" && find . -mindepth 1 ! -type d -printf '%P\n' |
         awk -F'\t' 'NR == FNR { own[$2] = own[$2] " " $1; next }
@@ -605,6 +632,7 @@ build_one() {
   fi
   if ((EUID == 0)); then pacman -Sy >/dev/null 2>&1 || true; fi
   ok "$label [$NAME]: ${files[*]##*/}"
+  grep -h '^==> saur:' "$log" | sed "s|^==> saur:|   $label:|" >&2 || true
   use_channel stable
 }
 

@@ -58,7 +58,7 @@ Or open the web list at <https://szmelc-inc.github.io/SAUR>. Machine-readable li
 
 Every branch of every repo is scanned. The default branch goes to stable and any other branch goes to experimental. Branches already merged into the default one, or still at the same commit, are skipped. So are `dependabot/*`, `renovate/*` and `gh-pages` (see `SAUR_IGNORE_BRANCHES`).
 
-Experimental packages are renamed so they install next to the stable ones: `foo-ex`, with the description tagged `[experimental: branch@commit]`. Inside the package, the commands in `/usr/bin`, man pages, bash/zsh/fish completions and `.desktop` entries get the suffix too, so you run `foo` and `foo-ex` side by side. The PKGBUILD's own functions still see the original `$pkgname`, so paths like `/usr/share/$pkgname` stay what the author wrote.
+Experimental packages are renamed so they install next to the stable ones: `foo-ex`, with the description tagged `[experimental: branch@commit]`. Inside the package, the commands in `/usr/bin`, man pages, bash/zsh/fish completions, `.desktop` entries, licenses and docs get the suffix too, so you run `foo` and `foo-ex` side by side. Inherited `provides`/`conflicts` that point at the package itself are renamed as well (a `foo-git` with `provides=(foo) conflicts=(foo)` becomes `foo-git-ex` providing `foo-ex`), and `replaces` is dropped, so `pacman -Syu` never swaps a stable package for an experimental one. The PKGBUILD's own functions still see the original `$pkgname`, so paths like `/usr/share/$pkgname` stay what the author wrote.
 
 **The PKGBUILD decides.** Put one line in it to override the branch rule:
 
