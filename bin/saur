@@ -1,0 +1,1229 @@
+#!/usr/bin/env bash
+# saur - build, publish and serve SAUR (Szmelc AUR), a pacman repository that
+# rebuilds itself from every repo holding a PKGBUILD.
+#
+# The same script runs in GitHub Actions and on any PC (via docker/podman),
+# so the repository never depends on one hosting provider.
+set -Eeuo pipefail
+shopt -s nullglob
+
+SAUR_VERSION=0.1.0
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+setup_colors() {
+  if [[ -z ${NO_COLOR:-} && ${SAUR_NO_COLOR:-0} != 1 ]] && { [[ -t 1 ]] || [[ -n ${GITHUB_ACTIONS:-} ]]; }; then
+    B=$'\e[1m' D=$'\e[90m' R=$'\e[0m' RED=$'\e[31m' GRN=$'\e[32m' YLW=$'\e[33m' BLU=$'\e[34m' MAG=$'\e[35m' CYN=$'\e[36m'
+  else
+    B='' D='' R='' RED='' GRN='' YLW='' BLU='' MAG='' CYN=''
+  fi
+}
+QUIET=0
+info() { ((QUIET)) || printf '%s::%s %s\n' "$BLU" "$R" "$*" >&2; }
+ok()   { ((QUIET)) || printf '%s ✓%s %s\n' "$GRN" "$R" "$*" >&2; }
+warn() { printf '%s !!%s %s\n' "$YLW" "$R" "$*" >&2; }
+err()  { printf '%s ✗%s %s\n' "$RED" "$R" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+step() { ((QUIET)) || printf '\n%s==>%s %s%s%s\n' "$MAG" "$R" "$B" "$*" "$R" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+group()    { if [[ -n ${GITHUB_ACTIONS:-} ]]; then echo "::group::$*" >&2; fi; }
+endgroup() { if [[ -n ${GITHUB_ACTIONS:-} ]]; then echo "::endgroup::" >&2; fi; }
+
+# Print TSV from stdin as an aligned table with a bold header ($1, tab-separated).
+table() {
+  local header=$1
+  { printf '%s\n' "$header"; cat; } | if have column; then column -t -s $'\t'; else tr '\t' ' '; fi |
+    { IFS= read -r h && printf '%s%s%s\n' "$B" "$h" "$R"; cat; }
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CONFIG_VARS=(SAUR_NAME SAUR_ORG SAUR_ARCH SAUR_URL SAUR_MIRRORS SAUR_GH_REPO SAUR_INCLUDE_FORKS
+  SAUR_INCLUDE_ARCHIVED SAUR_INCLUDE_PRIVATE SAUR_IGNORE_PATHS SAUR_BUILD_TIMEOUT SAUR_NOCHECK
+  SAUR_IMAGE SAUR_ENGINE SAUR_PACKAGER SAUR_WORK SAUR_OUT SAUR_STATE SAUR_PORT SAUR_JOBS)
+
+resolve_home() {
+  if [[ -n ${SAUR_HOME:-} ]]; then :
+  elif [[ -f $PWD/saur.conf ]]; then SAUR_HOME=$PWD
+  elif [[ -f ${SELF%/bin/*}/saur.conf ]]; then SAUR_HOME=${SELF%/bin/*}
+  else SAUR_HOME=${XDG_DATA_HOME:-$HOME/.local/share}/saur
+  fi
+  SAUR_HOME=$(readlink -m "$SAUR_HOME")
+}
+
+load_config() {
+  # Defaults < saur.conf < saur.local.conf < environment.
+  local envsnap f
+  envsnap=$(declare -px | grep -E '^declare -x SAUR_' | sed 's/^declare -x /declare -gx /' || true)
+  SAUR_NAME=saur
+  SAUR_ORG=Szmelc-INC
+  SAUR_ARCH=x86_64
+  SAUR_URL=https://szmelc-inc.github.io/SAUR
+  SAUR_MIRRORS='https://github.com/Szmelc-INC/SAUR/releases/download/$arch'
+  SAUR_GH_REPO=Szmelc-INC/SAUR
+  SAUR_INCLUDE_FORKS=0 SAUR_INCLUDE_ARCHIVED=0 SAUR_INCLUDE_PRIVATE=0
+  SAUR_IGNORE_PATHS='(^|/)(tests?|testdata|examples?|vendor|node_modules|third_party)/'
+  SAUR_BUILD_TIMEOUT=3600 SAUR_NOCHECK=0
+  SAUR_IMAGE=docker.io/library/archlinux:base-devel SAUR_ENGINE=
+  SAUR_PACKAGER='SAUR <https://github.com/Szmelc-INC/SAUR>'
+  SAUR_WORK=work SAUR_OUT=public SAUR_STATE=state SAUR_PORT=8080 SAUR_JOBS=8
+  for f in "$SAUR_HOME/saur.conf" "$SAUR_HOME/saur.local.conf"; do
+    # shellcheck disable=SC1090
+    if [[ -f $f ]]; then source "$f"; fi
+  done
+  eval "$envsnap"
+  abs() { if [[ $1 == /* ]]; then printf '%s' "$1"; else printf '%s/%s' "$SAUR_HOME" "$1"; fi; }
+  WORK=$(abs "$SAUR_WORK") OUT=$(abs "$SAUR_OUT") STATEDIR=$(abs "$SAUR_STATE")
+  ARCH=$SAUR_ARCH NAME=$SAUR_NAME
+  REPODIR=$OUT/$ARCH DB=$OUT/$ARCH/$NAME.db.tar.gz
+  STATE=$STATEDIR/$ARCH.tsv LOGS=$WORK/logs
+  BUILDER=saurbuild
+}
+
+# ---------------------------------------------------------------------------
+# State: url \t sha \t status \t pkgnames(, or -) \t unix-time
+# ---------------------------------------------------------------------------
+declare -A ST_SHA=() ST_STATUS=() ST_PKGS=() ST_TIME=()
+state_load() {
+  [[ -f $STATE ]] || return 0
+  local url sha status pkgs t
+  while IFS=$'\t' read -r url sha status pkgs t; do
+    [[ -z $url || $url == \#* ]] && continue
+    [[ $pkgs == - ]] && pkgs=
+    ST_SHA[$url]=$sha ST_STATUS[$url]=$status ST_PKGS[$url]=$pkgs ST_TIME[$url]=$t
+  done <"$STATE"
+}
+state_save() {
+  mkdir -p "$STATEDIR"
+  local url tmp=$STATE.tmp
+  {
+    printf '# url\tsha\tstatus\tpackages\ttime\n'
+    for url in "${!ST_SHA[@]}"; do
+      # "-" for no packages: tab is IFS whitespace, an empty field would collapse on read.
+      printf '%s\t%s\t%s\t%s\t%s\n' "$url" "${ST_SHA[$url]}" "${ST_STATUS[$url]}" "${ST_PKGS[$url]:--}" "${ST_TIME[$url]}"
+    done | sort -f
+  } >"$tmp"
+  mv "$tmp" "$STATE"
+}
+state_set() { ST_SHA[$1]=$2 ST_STATUS[$1]=$3 ST_PKGS[$1]=$4 ST_TIME[$1]=$(date +%s); }
+state_del() { unset 'ST_SHA[$1]' 'ST_STATUS[$1]' 'ST_PKGS[$1]' 'ST_TIME[$1]'; }
+
+# ---------------------------------------------------------------------------
+# Repository database helpers
+# ---------------------------------------------------------------------------
+untar() { if have bsdtar; then bsdtar -xOf "$1" "$2"; else tar --wildcards -xOzf "$1" "$2"; fi; }
+
+# name \t version \t desc \t filename \t csize \t builddate \t url \t arch
+db_records() {
+  [[ -f $DB ]] || return 0
+  untar "$DB" '*/desc' 2>/dev/null | awk '
+    function flush() { if (n != "") print n "\t" v "\t" d "\t" f "\t" c "\t" b "\t" u "\t" a; n = v = d = f = c = b = u = a = "" }
+    /^%[A-Z0-9]+%$/ { if ($0 == "%FILENAME%") flush(); k = $0; next }
+    /^$/ { k = ""; next }
+    { gsub(/\t/, " ") }
+    k == "%FILENAME%" { f = $0 } k == "%NAME%" { n = $0 } k == "%VERSION%" { v = $0 }
+    k == "%DESC%" { d = $0 } k == "%CSIZE%" { c = $0 } k == "%BUILDDATE%" { b = $0 }
+    k == "%URL%" { u = $0 } k == "%ARCH%" { a = $0 }
+    END { flush() }' | sort -f || true
+}
+db_version() { db_records | awk -F'\t' -v n="$1" '$1 == n { print $2; exit }'; }
+
+db_init() {
+  mkdir -p "$REPODIR"
+  if [[ ! -f $DB ]]; then
+    tar -czf "$DB" -T /dev/null
+    cp "$DB" "$REPODIR/$NAME.files.tar.gz"
+  fi
+  local base
+  for base in db files; do
+    [[ -e $REPODIR/$NAME.$base ]] || ln -sf "$NAME.$base.tar.gz" "$REPODIR/$NAME.$base"
+  done
+}
+
+# Replace the db/files symlinks with real copies (static hosts and release assets need files).
+db_materialize() {
+  local f
+  for f in "$REPODIR/$NAME.db" "$REPODIR/$NAME.files"; do
+    if [[ -L $f ]]; then cp --remove-destination "$(readlink -f "$f")" "$f"; fi
+  done
+  rm -f "$REPODIR"/*.old
+}
+
+# Delete package files the database no longer references.
+db_gc() {
+  local -A keep=()
+  local fn f n=0
+  while IFS=$'\t' read -r _ _ _ fn _; do keep[$fn]=1; done < <(db_records)
+  for f in "$REPODIR"/*.pkg.tar.*; do
+    fn=${f##*/}; fn=${fn%.sig}
+    [[ -n ${keep[$fn]:-} ]] || { rm -f "$f"; n=$((n + 1)); }
+  done
+  ((n == 0)) || info "removed $n stale package file(s)"
+}
+
+# ---------------------------------------------------------------------------
+# Sources: which git repos to look at
+# ---------------------------------------------------------------------------
+gh_api() {
+  local -a auth=()
+  local tok=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+  [[ -n $tok ]] && auth=(-H "Authorization: Bearer $tok")
+  curl -fsSL "${auth[@]}" -H 'Accept: application/vnd.github+json' "https://api.github.com/$1"
+}
+
+normalize_url() {
+  local u=$1
+  [[ $u == *://* || $u == git@* ]] || u=https://github.com/$u
+  [[ $u == https://github.com/* && $u != *.git ]] && u=$u.git
+  printf '%s' "$u"
+}
+short_id() { local u=${1%.git}; u=${u#https://github.com/}; printf '%s' "$u"; }
+slug() { short_id "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# Output: url \t branch ("-" = remote HEAD; tab is IFS whitespace, so fields are never empty)
+list_sources() {
+  local org=$SAUR_ORG page=1 json n total=0
+  local -a lines=()
+  if [[ -n $org ]]; then
+    local base="orgs/$org/repos"
+    gh_api "orgs/$org" >/dev/null 2>&1 || base="users/$org/repos"
+    while :; do
+      json=$(gh_api "$base?per_page=100&type=all&page=$page") || die "GitHub API request failed ($base page $page)"
+      n=$(jq 'length' <<<"$json")
+      ((n > 0)) || break
+      total=$((total + n))
+      mapfile -t -O "${#lines[@]}" lines < <(jq -r \
+        --argjson forks "$SAUR_INCLUDE_FORKS" --argjson arch "$SAUR_INCLUDE_ARCHIVED" --argjson priv "$SAUR_INCLUDE_PRIVATE" \
+        '.[] | select((.fork | not) or $forks == 1) | select((.archived | not) or $arch == 1)
+             | select((.private | not) or $priv == 1) | .clone_url + "\t-"' <<<"$json")
+      ((n == 100)) || break
+      page=$((page + 1))
+    done
+    ((total > 0)) || die "no repositories found for '$org' (refusing to continue: that would unpublish everything)"
+  fi
+  local line url br
+  if [[ -f $SAUR_HOME/repos.extra ]]; then
+    while IFS= read -r line; do
+      line=${line%%#*}; line=$(xargs <<<"$line")
+      [[ -z $line ]] && continue
+      url=$line br=-
+      if [[ $line == git@* ]]; then
+        [[ $line == git@*@* ]] && { url=${line%@*}; br=${line##*@}; }
+      elif [[ $line == *@* ]]; then
+        url=${line%@*} br=${line##*@}
+      fi
+      lines+=("$(normalize_url "$url")"$'\t'"$br")
+    done <"$SAUR_HOME/repos.extra"
+  fi
+  local -A ignore=() seen=()
+  if [[ -f $SAUR_HOME/repos.ignore ]]; then
+    while IFS= read -r line; do
+      line=${line%%#*}; line=$(xargs <<<"$line")
+      [[ -n $line ]] && ignore[${line,,}]=1
+    done <"$SAUR_HOME/repos.ignore"
+  fi
+  local id
+  for line in "${lines[@]}"; do
+    url=${line%%$'\t'*}
+    id=$(short_id "$url"); id=${id,,}
+    [[ -n ${ignore[$id]:-} || -n ${ignore[${id##*/}]:-} || -n ${seen[$url]:-} ]] && continue
+    seen[$url]=1
+    printf '%s\n' "$line"
+  done
+}
+
+_lsremote() {
+  local url=${1%%$'\t'*} br=${1#*$'\t'} ref= sha
+  [[ $br == - ]] || ref=refs/heads/$br
+  sha=$(GIT_TERMINAL_PROMPT=0 timeout 60 git ls-remote "$url" "${ref:-HEAD}" 2>/dev/null | awk 'NR == 1 { print $1 }') || true
+  printf '%s\t%s\t%s\n' "$url" "$br" "${sha:-?}"
+}
+export -f _lsremote
+
+# Output: url \t branch \t sha
+resolve_shas() { xargs -d '\n' -r -P "$SAUR_JOBS" -n 1 bash -c '_lsremote "$1"' _ | sort -f; }
+
+# ---------------------------------------------------------------------------
+# Building
+# ---------------------------------------------------------------------------
+as_builder() {
+  if ((EUID == 0)); then runuser -u "$BUILDER" -- env HOME="/home/$BUILDER" "$@"; else "$@"; fi
+}
+
+native_prepare() {
+  ((EUID == 0)) || return 0
+  id "$BUILDER" >/dev/null 2>&1 || useradd -m "$BUILDER"
+  mkdir -p /etc/makepkg.conf.d
+  # Arch enables split debug packages by default; SAUR does not ship them.
+  printf 'OPTIONS+=(!debug)\nMAKEFLAGS="-j%s"\n' "$(nproc)" >/etc/makepkg.conf.d/saur.conf
+  # Let packages depend on each other: expose the repo being built to pacman.
+  if ! grep -q "^\[$NAME\]" /etc/pacman.conf; then
+    printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = file://%s\n' "$NAME" "$REPODIR" >>/etc/pacman.conf
+  fi
+  pacman -Sy >/dev/null 2>&1 || true
+}
+
+srcinfo_get() { awk -F' = ' -v k="$2" '$1 == "\t" k || $1 == k { print $2 }' <<<"$1"; }
+
+# Build one PKGBUILD directory. Sets BUILT_NAMES. Returns 0 ok, 1 failed, 2 skipped (arch).
+BUILT_NAMES=()
+build_one() {
+  local d=$1 label=$2 log srcinfo
+  BUILT_NAMES=()
+  log="$LOGS/$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '_').log"
+  : >"$log"
+  if ((EUID == 0)); then chown "$BUILDER:" "$log"; fi
+  if ! srcinfo=$(cd "$d" && as_builder makepkg --printsrcinfo 2>>"$log"); then
+    err "$label: cannot parse PKGBUILD (see $log)"; return 1
+  fi
+  local -a names arches deps
+  mapfile -t names < <(srcinfo_get "$srcinfo" pkgname)
+  mapfile -t arches < <(srcinfo_get "$srcinfo" arch | sort -u)
+  local ver rel epoch
+  ver=$(srcinfo_get "$srcinfo" pkgver | head -1)
+  rel=$(srcinfo_get "$srcinfo" pkgrel | head -1)
+  epoch=$(srcinfo_get "$srcinfo" epoch | head -1)
+  if [[ " ${arches[*]} " != *" any "* && " ${arches[*]} " != *" $ARCH "* ]]; then
+    warn "$label: arch (${arches[*]}) does not include $ARCH, skipping"; return 2
+  fi
+  local kinds='depends|makedepends'
+  ((SAUR_NOCHECK)) || kinds+='|checkdepends'
+  mapfile -t deps < <(awk -F' = ' -v re="^\t?($kinds)(_$ARCH)?$" '$1 ~ re { print $2 }' <<<"$srcinfo" | sort -u)
+
+  if ((EUID == 0 && ${#deps[@]})); then
+    local -a missing
+    mapfile -t missing < <(pacman -T "${deps[@]}" 2>/dev/null || true)
+    if ((${#missing[@]})); then
+      info "$label: installing ${#missing[@]} dependencies"
+      if ! pacman -S --needed --noconfirm --asdeps "${missing[@]%%[<>=]*}" >>"$log" 2>&1; then
+        err "$label: dependencies not installable: ${missing[*]}"; return 1
+      fi
+    fi
+  fi
+
+  # A static pkgver would rebuild to the same version and nobody would upgrade:
+  # bump pkgrel past the published one instead.
+  if ! grep -Eq '^[[:space:]]*pkgver[[:space:]]*\(\)' "$d/PKGBUILD"; then
+    local mine="${epoch:+$epoch:}$ver" cur
+    cur=$(db_version "${names[0]}")
+    if [[ -n $cur && ${cur%-*} == "$mine" ]] && (($(vercmp "$mine-$rel" "$cur") <= 0)); then
+      local currel=${cur##*-}
+      local newrel=$((${currel%%.*} + 1))
+      sed -i -E "s/^pkgrel=.*/pkgrel=$newrel/" "$d/PKGBUILD"
+      info "$label: same version as published ($cur), pkgrel -> $newrel"
+    fi
+  fi
+
+  local pkgdest=$WORK/pkgdest/${label//[\/:]/_}
+  rm -rf "$pkgdest"; mkdir -p "$pkgdest"
+  if ((EUID == 0)); then chown "$BUILDER:" "$pkgdest"; fi
+  local -a mflags=(-f --noconfirm --noprogressbar)
+  ((SAUR_NOCHECK)) && mflags+=(--nocheck)
+  ((EUID == 0)) || mflags+=(-s --needed)
+  info "$label: makepkg (${names[*]})"
+  local rc=0
+  (cd "$d" && as_builder env PKGDEST="$pkgdest" PACKAGER="$SAUR_PACKAGER" \
+    timeout "$SAUR_BUILD_TIMEOUT" makepkg "${mflags[@]}") >>"$log" 2>&1 || rc=$?
+  if ((rc)); then
+    err "$label: build failed (exit $rc), log: $log"
+    group "build log: $label"; tail -n 60 "$log" >&2; endgroup
+    return 1
+  fi
+
+  local -a files=()
+  local f n
+  for f in "$pkgdest"/*.pkg.tar.*; do
+    [[ $f == *.sig ]] && continue
+    n=${f##*/}; n=${n%-*-*-*}
+    [[ " ${names[*]} " == *" $n "* ]] || continue
+    mv -f "$f" "$REPODIR/"
+    files+=("$REPODIR/${f##*/}")
+    BUILT_NAMES+=("$n")
+  done
+  ((${#files[@]})) || { err "$label: makepkg produced no packages"; return 1; }
+  repo-add -q -R "$DB" "${files[@]}" >>"$log" 2>&1 || { err "$label: repo-add failed"; return 1; }
+  if ((EUID == 0)); then pacman -Sy >/dev/null 2>&1 || true; fi
+  ok "$label: ${files[*]##*/}"
+}
+
+# Remove packages by name from the database.
+db_remove() {
+  (($#)) || return 0
+  local -a present=()
+  local n
+  for n in "$@"; do [[ -n $(db_version "$n") ]] && present+=("$n"); done
+  ((${#present[@]})) || return 0
+  repo-remove -q "$DB" "${present[@]}" >/dev/null 2>&1 || warn "repo-remove failed for ${present[*]}"
+  info "unpublished: ${present[*]}"
+}
+
+container_engine() {
+  if [[ -n $SAUR_ENGINE ]]; then printf '%s' "$SAUR_ENGINE"
+  elif have podman; then printf podman
+  elif have docker; then printf docker
+  else die "need docker or podman (or run on Arch as root with --native)"
+  fi
+}
+
+# Re-run this script inside an Arch container. Everything lives under SAUR_HOME.
+in_container() {
+  # SAUR_ENGINE may carry a prefix, e.g. "pkexec docker" when not in the docker group.
+  local -a engine
+  read -ra engine <<<"$(container_engine)"
+  local -a envs=() vars=("${CONFIG_VARS[@]}" GH_TOKEN GITHUB_TOKEN NO_COLOR SAUR_NO_COLOR)
+  local v
+  for v in "${vars[@]}"; do [[ -n ${!v:-} ]] && envs+=(-e "$v=${!v}"); done
+  for v in "$WORK" "$OUT" "$STATEDIR"; do
+    [[ $v == "$SAUR_HOME"/* ]] || die "$v must live inside SAUR_HOME ($SAUR_HOME) for container builds"
+  done
+  mkdir -p "$WORK/pacman-cache"
+  local -a tty=()
+  [[ -t 1 ]] && tty=(-t)
+  info "running in ${engine[*]} ($SAUR_IMAGE)"
+  "${engine[@]}" run --rm "${tty[@]}" "${envs[@]}" \
+    -e SAUR_HOME=/saur -e "HOST_ID=$(id -u):$(id -g)" -e "SAUR_ENGINE_NAME=${engine[-1]}" \
+    -v "$SAUR_HOME:/saur" -v "$SELF:/usr/local/bin/saur:ro" \
+    -v "$WORK/pacman-cache:/var/cache/pacman/pkg" -w /saur "$SAUR_IMAGE" \
+    bash -c 'pacman -Syu --noconfirm --needed git jq curl >/dev/null || exit 1
+      rc=0; saur "$@" --native || rc=$?
+      if [[ $SAUR_ENGINE_NAME == docker ]]; then chown -R "$HOST_ID" /saur/work /saur/public /saur/state 2>/dev/null; fi
+      exit $rc' _ "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+matches_filter() { # $1=url, rest=filters
+  local id; id=$(short_id "$1"); id=${id,,}; shift
+  (($#)) || return 0
+  local f
+  for f in "$@"; do f=${f,,}; [[ $id == "$f" || ${id##*/} == "$f" || $id == *"$f"* ]] && return 0; done
+  return 1
+}
+
+# Decide what to do with a source: build | skip
+plan_action() { # url sha
+  local url=$1 sha=$2 n
+  if ((FORCE)); then echo build; return; fi
+  if [[ -z ${ST_SHA[$url]:-} || ${ST_SHA[$url]} != "$sha" ]]; then echo build; return; fi
+  case ${ST_STATUS[$url]} in
+    fail) if ((RETRY_FAILED)); then echo build; else echo skip; fi ;;
+    ok)
+      # Published packages missing from the db (fresh checkout, lost storage): rebuild.
+      for n in ${ST_PKGS[$url]//,/ }; do [[ -n ${DBVER[$n]:-} ]] || { echo build; return; }; done
+      echo skip ;;
+    *) echo skip ;;
+  esac
+}
+
+FORCE=0 RETRY_FAILED=0 MODE=auto DRY=0 JSON=0
+FILTERS=()
+declare -A DBVER=()
+load_dbver() { DBVER=(); local n v; while IFS=$'\t' read -r n v _; do [[ -n $n ]] && DBVER[$n]=$v; done < <(db_records); }
+
+parse_build_flags() {
+  FILTERS=()
+  while (($#)); do
+    case $1 in
+      -f|--force) FORCE=1 ;;
+      -r|--retry-failed) RETRY_FAILED=1 ;;
+      -n|--dry-run) DRY=1 ;;
+      --native) MODE=native ;;
+      --container) MODE=container ;;
+      --json) JSON=1 ;;
+      -h|--help) help_cmd "$CMD"; exit 0 ;;
+      -*) die "unknown flag: $1 (see: saur help $CMD)" ;;
+      *) FILTERS+=("$1") ;;
+    esac
+    shift
+  done
+}
+
+want_native() {
+  case $MODE in
+    native) return 0 ;;
+    container) return 1 ;;
+    *) [[ -f /etc/arch-release && $EUID -eq 0 ]] ;;
+  esac
+}
+
+passthrough_flags() {
+  PASS=()
+  ((FORCE)) && PASS+=(--force)
+  ((RETRY_FAILED)) && PASS+=(--retry-failed)
+  ((DRY)) && PASS+=(--dry-run)
+  return 0
+}
+
+cmd_scan() {
+  parse_build_flags "$@"
+  state_load; load_dbver
+  step "Scanning sources"
+  local rows url br sha
+  rows=$(list_sources | resolve_shas)
+  if ((JSON)); then
+    while IFS=$'\t' read -r url br sha; do
+      matches_filter "$url" "${FILTERS[@]}" || continue
+      jq -nc --arg url "$url" --arg id "$(short_id "$url")" --arg branch "$br" --arg sha "$sha" \
+        --arg status "${ST_STATUS[$url]:-new}" --arg action "$(plan_action "$url" "$sha")" \
+        --arg packages "${ST_PKGS[$url]:-}" \
+        '{id:$id,url:$url,branch:$branch,sha:$sha,status:$status,action:$action,packages:($packages|split(",")|map(select(.!="")))}'
+    done <<<"$rows" | jq -s .
+    return
+  fi
+  local st act c
+  while IFS=$'\t' read -r url br sha; do
+    matches_filter "$url" "${FILTERS[@]}" || continue
+    st=${ST_STATUS[$url]:-new}; act=$(plan_action "$url" "$sha")
+    c=$D; [[ $act == build ]] && c=$CYN; [[ $st == fail ]] && c=$RED
+    printf '%s\t%s\t%s\t%s%s%s\t%s\n' "$(short_id "$url")" "${sha:0:10}" "$st" "$c" "$act" "$R" "${ST_PKGS[$url]:-}"
+  done <<<"$rows" | table $'REPO\tSHA\tSTATUS\tACTION\tPACKAGES'
+}
+
+cmd_build() {
+  parse_build_flags "$@"
+  if ! want_native; then
+    passthrough_flags
+    in_container "$CMD" "${PASS[@]}" "${FILTERS[@]}"
+    return
+  fi
+  local t
+  for t in git jq curl makepkg repo-add vercmp; do have "$t" || die "missing tool: $t"; done
+  mkdir -p "$WORK/src" "$LOGS"
+  db_init; native_prepare; state_load; load_dbver
+  if ((EUID == 0)); then chown "$BUILDER:" "$LOGS"; fi
+  local before; before=$(cat "$DB" "$STATE" 2>/dev/null | sha256sum || true)
+
+  step "Scanning sources"
+  local rows; rows=$(list_sources | resolve_shas)
+  local -A current=()
+  local -a todo=()
+  local url br sha
+  while IFS=$'\t' read -r url br sha; do
+    [[ -z $url ]] && continue
+    current[$url]=1
+    matches_filter "$url" "${FILTERS[@]}" || continue
+    if [[ $sha == '?' ]]; then warn "$(short_id "$url"): unreachable, keeping as is"; continue; fi
+    [[ $(plan_action "$url" "$sha") == build ]] && todo+=("$url"$'\t'"$br")
+  done <<<"$rows"
+  info "${#current[@]} sources, ${#todo[@]} to (re)build"
+
+  # Sources that vanished (deleted, archived, ignored): unpublish them.
+  if ((${#FILTERS[@]} == 0)); then
+    for url in "${!ST_SHA[@]}"; do
+      [[ -n ${current[$url]:-} ]] && continue
+      info "$(short_id "$url"): no longer a source"
+      if ((!DRY)); then
+        # shellcheck disable=SC2086
+        db_remove ${ST_PKGS[$url]//,/ }
+        state_del "$url"
+      fi
+    done
+  fi
+  if ((DRY)); then
+    local i
+    for i in "${todo[@]}"; do printf '  would build: %s\n' "$(short_id "${i%%$'\t'*}")" >&2; done
+    return 0
+  fi
+
+  local -a built=() failed=()
+  local item dir head pkgb label rc id old n
+  for item in "${todo[@]}"; do
+    url=${item%%$'\t'*} br=${item#*$'\t'}
+    [[ $br == - ]] && br=
+    id=$(short_id "$url")
+    step "$id"
+    dir=$WORK/src/$(slug "$url")
+    rm -rf "$dir"
+    if ! GIT_TERMINAL_PROMPT=0 git clone -q --filter=blob:none --no-checkout ${br:+--branch "$br"} "$url" "$dir" 2>&1; then
+      err "$id: clone failed"; continue
+    fi
+    head=$(git -C "$dir" rev-parse HEAD)
+    old=${ST_PKGS[$url]:-}
+    local -a pkgbuilds
+    mapfile -t pkgbuilds < <(git -C "$dir" ls-tree -r --name-only HEAD | grep -E '(^|/)PKGBUILD$' | grep -Ev "$SAUR_IGNORE_PATHS" || true)
+    if ((${#pkgbuilds[@]} == 0)); then
+      # shellcheck disable=SC2086
+      [[ -n $old ]] && db_remove ${old//,/ }
+      state_set "$url" "$head" none ""
+      rm -rf "$dir"; info "$id: no PKGBUILD"; continue
+    fi
+    if ! git -C "$dir" checkout -q 2>&1; then
+      err "$id: checkout failed"; state_set "$url" "$head" fail "$old"; failed+=("$id"); continue
+    fi
+    if [[ -f $dir/.gitmodules ]]; then GIT_TERMINAL_PROMPT=0 git -C "$dir" submodule update -q --init --recursive 2>&1 || true; fi
+    if ((EUID == 0)); then chown -R "$BUILDER:" "$dir"; fi
+    local -a names=()
+    local any_fail=0
+    for pkgb in "${pkgbuilds[@]}"; do
+      label=$id; [[ $pkgb != PKGBUILD ]] && label+=":${pkgb%/PKGBUILD}"
+      rc=0; build_one "$dir/$(dirname "$pkgb")" "$label" || rc=$?
+      case $rc in
+        0) names+=("${BUILT_NAMES[@]}"); built+=("$label") ;;
+        2) ;;
+        *) any_fail=1; failed+=("$label") ;;
+      esac
+    done
+    if ((any_fail)); then
+      # Keep whatever was published before; retry when the repo changes.
+      # shellcheck disable=SC2086
+      state_set "$url" "$head" fail "$(printf '%s\n' ${old//,/ } "${names[@]}" | grep . | sort -u | paste -sd, - || true)"
+    else
+      # Drop packages this repo stopped producing.
+      local -a gone=()
+      for n in ${old//,/ }; do [[ " ${names[*]} " == *" $n "* ]] || gone+=("$n"); done
+      db_remove "${gone[@]}"
+      if ((${#names[@]})); then
+        state_set "$url" "$head" ok "$(printf '%s\n' "${names[@]}" | sort -u | paste -sd, -)"
+      else
+        state_set "$url" "$head" none ""
+      fi
+    fi
+    state_save
+    rm -rf "$dir"
+  done
+  db_gc
+  state_save
+
+  local after; after=$(cat "$DB" "$STATE" 2>/dev/null | sha256sum || true)
+  local changed=false
+  [[ $before != "$after" ]] && changed=true
+  echo "$changed" >"$WORK/changed"
+  if [[ -n ${GITHUB_OUTPUT:-} ]]; then echo "changed=$changed" >>"$GITHUB_OUTPUT"; fi
+  step "Summary"
+  ok "built: ${#built[@]}"
+  ((${#failed[@]} == 0)) || warn "failed: ${failed[*]}"
+  if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
+    {
+      echo "### SAUR $ARCH"
+      echo "| result | package source |"; echo "|---|---|"
+      for label in "${built[@]}"; do echo "| ✅ built | \`$label\` |"; done
+      for label in "${failed[@]}"; do echo "| ❌ failed | \`$label\` |"; done
+      ((${#built[@]} + ${#failed[@]})) || echo "| ➖ | nothing changed |"
+    } >>"$GITHUB_STEP_SUMMARY"
+  fi
+  return 0
+}
+
+cmd_run() {
+  parse_build_flags "$@"
+  if ! want_native; then
+    passthrough_flags
+    in_container run "${PASS[@]}" "${FILTERS[@]}"
+    return
+  fi
+  CMD=build cmd_build "$@"
+  ((DRY)) || cmd_site
+}
+
+server_lines() {
+  # shellcheck disable=SC2016
+  printf 'Server = %s/$arch\n' "$SAUR_URL"
+  local m
+  for m in $SAUR_MIRRORS; do printf 'Server = %s\n' "$m"; done
+}
+
+html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+
+cmd_site() {
+  if [[ ${1:-} == -h || ${1:-} == --help ]]; then help_cmd site; exit 0; fi
+  db_init; db_materialize
+  step "Generating site in $OUT"
+  local recs; recs=$(db_records)
+  jq -R -s --arg arch "$ARCH" 'split("\n") | map(select(length > 0) | split("\t")
+      | {name: .[0], version: .[1], description: .[2], filename: .[3], size: (.[4] | tonumber? // 0),
+         builddate: (.[5] | tonumber? // 0), url: .[6], arch: .[7], download: ($arch + "/" + .[3])})' \
+    <<<"$recs" >"$OUT/packages.json"
+  cut -f1,2 <<<"$recs" | tr '\t' ' ' | grep . >"$OUT/packages.txt" || true
+
+  # One-time setup script: curl -fsSL $SAUR_URL/add | sudo bash
+  {
+    cat <<'EOF'
+#!/usr/bin/env bash
+# SAUR one-time setup: adds the repository to /etc/pacman.conf, syncs, says hi once.
+set -euo pipefail
+conf=${PACMAN_CONF:-/etc/pacman.conf}
+EOF
+    printf 'name=%q\n' "$NAME"
+    printf 'servers=%q\n' "$(server_lines)"
+    printf 'url=%q\n' "$SAUR_URL"
+    cat <<'EOF'
+if [[ $EUID -ne 0 ]]; then
+  echo "SAUR: needs root to edit $conf. Run: curl -fsSL $url/add | sudo bash" >&2
+  exit 1
+fi
+if grep -q "^\[$name\]" "$conf"; then
+  echo "SAUR: [$name] is already in $conf. Nothing to do. (Update with: pacman -Syu)"
+  exit 0
+fi
+cp "$conf" "$conf.saur.bak"
+printf '\n# SAUR (Szmelc AUR): %s\n[%s]\nSigLevel = Optional TrustAll\n%s\n' "$url" "$name" "$servers" >>"$conf"
+pacman -Syy
+count=$(pacman -Slq "$name" 2>/dev/null | wc -l)
+c=$'\e[1;35m' b=$'\e[1m' d=$'\e[2m' r=$'\e[0m'
+[[ -t 1 && -z ${NO_COLOR:-} ]] || c='' b='' d='' r=''
+cat <<MSG
+
+${c}  ▄▀▀ ▄▀▄ █ █ █▀▄   SAUR is in: ${count} Szmelc packages, rebuilt when their code changes.${r}
+${c}  ▄██ █▀█ ▀▄█ █▀▄${r}   ${d}This message shows once. Plain 'pacman -Syu' keeps them fresh.${r}
+
+  ${b}Browse:${r}   pacman -Sl $name
+  ${b}Details:${r}  pacman -Si \$(pacman -Slq $name)
+  ${b}Pick one:${r} pacman -Slq $name | fzf --preview 'pacman -Si $name/{}' | xargs -ro sudo pacman -S
+  ${b}Install:${r}  sudo pacman -S $name/<package>
+  ${b}Web:${r}      $url
+
+MSG
+EOF
+  } >"$OUT/add"
+  chmod 755 "$OUT/add"
+
+  local rows='' n v desc fn csz u
+  if [[ -n $recs ]]; then
+    rows=$(while IFS=$'\t' read -r n v desc fn csz _ u _; do
+      printf '<tr><td><a href="%s">%s</a></td><td><code>%s</code></td><td>%s</td><td class="r">%s</td><td><a href="%s/%s" title="download">pkg</a></td></tr>\n' \
+        "$(html_escape <<<"$u")" "$n" "$v" "$(html_escape <<<"$desc")" \
+        "$(numfmt --to=iec "${csz:-0}" 2>/dev/null || echo "$csz")" "$ARCH" "$fn"
+    done <<<"$recs")
+  fi
+  local count; count=$(grep -c . <<<"$recs" || true)
+  local updated; updated=$(date -u '+%Y-%m-%d %H:%M UTC')
+  cat >"$OUT/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SAUR · Szmelc AUR</title>
+<style>
+:root { --bg:#fbfaf8; --fg:#1d1b20; --mute:#6b6670; --line:#e6e2dd; --acc:#7a1fd1; --code:#f1eeea; }
+@media (prefers-color-scheme: dark) { :root { --bg:#141216; --fg:#ece8ef; --mute:#9a94a0; --line:#2b2730; --acc:#c08bff; --code:#1f1c23; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 ui-sans-serif,system-ui,sans-serif; }
+main { max-width:980px; margin:0 auto; padding:40px 16px 64px; }
+h1 { font-size:28px; margin:0 0 4px; letter-spacing:-.01em; } h1 span { color:var(--acc); }
+p { color:var(--mute); margin:0 0 20px; }
+pre { background:var(--code); border:1px solid var(--line); border-radius:8px; padding:12px 14px; overflow-x:auto; margin:0 0 28px; }
+code, pre { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+input { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; font:inherit; margin-bottom:12px; }
+.wrap { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; }
+th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+th { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mute); font-weight:600; }
+td.r { text-align:right; white-space:nowrap; color:var(--mute); }
+a { color:var(--acc); text-decoration:none; } a:hover { text-decoration:underline; }
+footer { margin-top:28px; color:var(--mute); font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+<h1><span>SAUR</span> · Szmelc AUR</h1>
+<p>${count} packages from Szmelc.INC, rebuilt automatically whenever their source changes. Add it once:</p>
+<pre>curl -fsSL ${SAUR_URL}/add | sudo bash</pre>
+<input id="q" type="search" placeholder="Filter packages…" aria-label="Filter packages">
+<div class="wrap"><table>
+<thead><tr><th>Package</th><th>Version</th><th>Description</th><th class="r">Size</th><th></th></tr></thead>
+<tbody id="rows">
+${rows}
+</tbody></table></div>
+<footer>Updated ${updated} · <a href="packages.json">packages.json</a> · <a href="https://github.com/${SAUR_GH_REPO}">source</a></footer>
+</main>
+<script>
+const q = document.getElementById('q');
+q.addEventListener('input', () => {
+  const s = q.value.toLowerCase();
+  for (const tr of document.querySelectorAll('#rows tr')) tr.hidden = !tr.textContent.toLowerCase().includes(s);
+});
+</script>
+</body>
+</html>
+EOF
+  ok "site: $count packages, add script, index.html, packages.json"
+}
+
+cmd_list() {
+  JSON=0
+  while (($#)); do case $1 in --json) JSON=1 ;; -h|--help) help_cmd list; exit 0 ;; *) die "unknown flag: $1" ;; esac; shift; done
+  if ((JSON)); then
+    db_records | jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {name: .[0], version: .[1], description: .[2], filename: .[3]})'
+    return
+  fi
+  [[ -f $DB ]] || die "no database yet at $DB (run: saur run)"
+  db_records | awk -F'\t' -v OFS='\t' '{ print $1, $2, substr($3, 1, 70) }' | table $'NAME\tVERSION\tDESCRIPTION'
+}
+
+cmd_status() {
+  JSON=0
+  while (($#)); do case $1 in --json) JSON=1 ;; -h|--help) help_cmd status; exit 0 ;; *) die "unknown flag: $1" ;; esac; shift; done
+  state_load
+  local url
+  if ((JSON)); then
+    for url in "${!ST_SHA[@]}"; do
+      jq -nc --arg id "$(short_id "$url")" --arg url "$url" --arg sha "${ST_SHA[$url]}" --arg status "${ST_STATUS[$url]}" \
+        --arg p "${ST_PKGS[$url]}" --argjson t "${ST_TIME[$url]:-0}" \
+        '{id:$id,url:$url,sha:$sha,status:$status,packages:($p|split(",")|map(select(.!=""))),time:$t}'
+    done | jq -s 'sort_by(.id)'
+    return
+  fi
+  local ok_n=0 fail_n=0 none_n=0
+  for url in "${!ST_STATUS[@]}"; do
+    case ${ST_STATUS[$url]} in ok) ok_n=$((ok_n + 1)) ;; fail) fail_n=$((fail_n + 1)) ;; *) none_n=$((none_n + 1)) ;; esac
+  done
+  printf '%sSAUR%s %s  ·  %s%d ok%s  %s%d failed%s  %s%d without PKGBUILD%s  ·  %s packages in db\n\n' \
+    "$B" "$R" "$ARCH" "$GRN" "$ok_n" "$R" "$RED" "$fail_n" "$R" "$D" "$none_n" "$R" "$(db_records | grep -c . || true)"
+  local c
+  for url in "${!ST_STATUS[@]}"; do
+    [[ ${ST_STATUS[$url]} == none ]] && continue
+    c=$GRN; [[ ${ST_STATUS[$url]} == fail ]] && c=$RED
+    printf '%s\t%s%s%s\t%s\t%s\t%s\n' "$(short_id "$url")" "$c" "${ST_STATUS[$url]}" "$R" "${ST_SHA[$url]:0:10}" \
+      "$(date -d "@${ST_TIME[$url]:-0}" '+%F %H:%M')" "${ST_PKGS[$url]}"
+  done | sort -f | table $'REPO\tSTATUS\tSHA\tCHECKED\tPACKAGES'
+}
+
+cmd_release() {
+  local sub=${1:-}
+  shift || true
+  case $sub in -h|--help) help_cmd release; exit 0 ;; '') help_cmd release; exit 1 ;; esac
+  have gh || die "release needs the GitHub CLI (gh)"
+  local tag=$ARCH repo=$SAUR_GH_REPO
+  case $sub in
+    pull)
+      mkdir -p "$REPODIR"
+      if ! gh release view "$tag" -R "$repo" >/dev/null 2>&1; then info "no release '$tag' yet, starting empty"; return 0; fi
+      step "Downloading release $repo@$tag"
+      gh release download "$tag" -R "$repo" -D "$REPODIR" --clobber
+      # GitHub stores ':' (epoch) as '.', restore the names pacman expects.
+      local fn
+      while IFS=$'\t' read -r _ _ _ fn _; do
+        if [[ $fn == *:* && ! -f $REPODIR/$fn && -f $REPODIR/${fn//:/.} ]]; then mv "$REPODIR/${fn//:/.}" "$REPODIR/$fn"; fi
+      done < <(db_records)
+      ok "$(find "$REPODIR" -name '*.pkg.tar.*' | wc -l) packages restored"
+      ;;
+    push)
+      db_init; db_materialize
+      gh release view "$tag" -R "$repo" >/dev/null 2>&1 ||
+        gh release create "$tag" -R "$repo" --title "SAUR $tag" --latest=false \
+          --notes "Package storage for SAUR ($tag). Add the repo: curl -fsSL $SAUR_URL/add | sudo bash"
+      step "Syncing release $repo@$tag"
+      local -A remote=() local_files=()
+      local name size f
+      while IFS=$'\t' read -r name size; do [[ -n $name ]] && remote[$name]=$size; done \
+        < <(gh release view "$tag" -R "$repo" --json assets -q '.assets[] | "\(.name)\t\(.size)"')
+      local -a up=()
+      for f in "$REPODIR"/*.pkg.tar.*; do
+        name=${f##*/}; name=${name//:/.}; local_files[$name]=1
+        [[ ${remote[$name]:-} == "$(stat -c %s "$f")" ]] || up+=("$f")
+      done
+      ((${#up[@]} == 0)) || gh release upload "$tag" -R "$repo" --clobber "${up[@]}"
+      # Database last, so the mirror never points at packages it lacks.
+      local -a dbf=("$REPODIR/$NAME".{db,files}{,.tar.gz})
+      for f in "${dbf[@]}"; do local_files[${f##*/}]=1; done
+      gh release upload "$tag" -R "$repo" --clobber "${dbf[@]}"
+      for name in "${!remote[@]}"; do
+        [[ -n ${local_files[$name]:-} ]] || gh release delete-asset "$tag" "$name" -R "$repo" -y
+      done
+      ok "release synced: ${#up[@]} package(s) uploaded"
+      ;;
+    *) die "unknown release action: $sub (pull|push)" ;;
+  esac
+}
+
+cmd_serve() {
+  local port=$SAUR_PORT bind=0.0.0.0
+  while (($#)); do
+    case $1 in
+      -p|--port) port=$2; shift ;;
+      -b|--bind) bind=$2; shift ;;
+      -h|--help) help_cmd serve; exit 0 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+    shift
+  done
+  [[ -d $OUT ]] || die "nothing to serve yet in $OUT (run: saur run)"
+  db_materialize 2>/dev/null || true
+  info "serving $OUT on http://$bind:$port  (pacman: Server = http://<this-host>:$port/\$arch)"
+  if have darkhttpd; then exec darkhttpd "$OUT" --port "$port" --addr "$bind"
+  elif have python3; then exec python3 -m http.server "$port" --bind "$bind" --directory "$OUT"
+  elif have busybox; then exec busybox httpd -f -p "$bind:$port" -h "$OUT"
+  else die "need darkhttpd, python3 or busybox to serve"
+  fi
+}
+
+cmd_timer() {
+  local sub=${1:-status} at='*-*-* 00:00:00' port=$SAUR_PORT
+  shift || true
+  while (($#)); do
+    case $1 in
+      --at) at=$2; shift ;;
+      -p|--port) port=$2; shift ;;
+      -h|--help) help_cmd timer; exit 0 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+    shift
+  done
+  local dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+  case $sub in
+    install)
+      mkdir -p "$dir"
+      cat >"$dir/saur-build.service" <<EOF
+[Unit]
+Description=SAUR: rebuild changed packages
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=SAUR_HOME=$SAUR_HOME
+ExecStart=$SELF run
+EOF
+      cat >"$dir/saur-build.timer" <<EOF
+[Unit]
+Description=SAUR: nightly rebuild
+
+[Timer]
+OnCalendar=$at
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target
+EOF
+      cat >"$dir/saur-serve.service" <<EOF
+[Unit]
+Description=SAUR: serve the pacman repository over HTTP
+After=network.target
+
+[Service]
+Environment=SAUR_HOME=$SAUR_HOME
+ExecStart=$SELF serve --port $port
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+EOF
+      systemctl --user daemon-reload
+      systemctl --user enable --now saur-build.timer saur-serve.service
+      ok "installed: nightly build ($at) and HTTP server on :$port"
+      info "keep them running after logout: loginctl enable-linger $USER"
+      ;;
+    remove)
+      systemctl --user disable --now saur-build.timer saur-serve.service 2>/dev/null || true
+      rm -f "$dir"/saur-{build.service,build.timer,serve.service}
+      systemctl --user daemon-reload
+      ok "removed SAUR user units"
+      ;;
+    status) systemctl --user list-timers saur-build.timer --no-pager; systemctl --user status saur-serve.service --no-pager || true ;;
+    *) die "unknown timer action: $sub (install|remove|status)" ;;
+  esac
+}
+
+cmd_extra() {
+  local sub=${1:-ls} f=$SAUR_HOME/repos.extra r
+  shift || true
+  case $sub in
+    ls|list) if [[ -f $f ]]; then grep -Ev '^\s*(#|$)' "$f" || true; fi ;;
+    add)
+      (($#)) || die "usage: saur extra add OWNER/REPO[@branch] | URL[@branch]"
+      for r in "$@"; do
+        if grep -qxF "$r" "$f" 2>/dev/null; then info "already listed: $r"; continue; fi
+        echo "$r" >>"$f"; ok "added $r"
+      done ;;
+    rm|remove)
+      (($#)) || die "usage: saur extra rm OWNER/REPO"
+      for r in "$@"; do
+        if ! grep -qxF "$r" "$f" 2>/dev/null; then warn "not listed: $r"; continue; fi
+        grep -vxF "$r" "$f" >"$f.tmp" || true; mv "$f.tmp" "$f"; ok "removed $r"
+      done ;;
+    -h|--help) help_cmd extra ;;
+    *) die "unknown extra action: $sub (ls|add|rm)" ;;
+  esac
+}
+
+cmd_config() {
+  local v
+  case ${1:-} in
+    --json)
+      for v in SAUR_HOME "${CONFIG_VARS[@]}"; do jq -nc --arg k "$v" --arg v "${!v}" '{($k):$v}'; done | jq -s add
+      return ;;
+    -h|--help) help_cmd config; exit 0 ;;
+  esac
+  for v in SAUR_HOME "${CONFIG_VARS[@]}"; do printf '%s\t%s\n' "$v" "${!v}"; done | table $'KEY\tVALUE'
+}
+
+cmd_doctor() {
+  local t bad=0
+  printf '%sSAUR %s%s  home: %s\n\n' "$B" "$SAUR_VERSION" "$R" "$SAUR_HOME"
+  for t in git curl jq tar bsdtar makepkg repo-add vercmp gh docker podman python3 darkhttpd systemctl; do
+    if have "$t"; then printf '  %s✓%s %s\n' "$GRN" "$R" "$t"; else printf '  %s·%s %s %s(missing)%s\n' "$YLW" "$R" "$t" "$D" "$R"; fi
+  done
+  echo
+  for t in git curl jq; do have "$t" || { err "required: $t"; bad=1; }; done
+  if ! { have makepkg && have repo-add; } && ! { have docker || have podman; }; then
+    err "building needs Arch tools (makepkg, repo-add) or a container engine (docker/podman)"; bad=1
+  fi
+  [[ -f $SAUR_HOME/saur.conf ]] || warn "no saur.conf in $SAUR_HOME (defaults in use; run: saur init)"
+  ((bad == 0)) || return 1
+  ok "ready"
+}
+
+cmd_init() {
+  mkdir -p "$SAUR_HOME"
+  if [[ -f $SAUR_HOME/saur.conf ]]; then info "$SAUR_HOME/saur.conf exists"; return 0; fi
+  cat >"$SAUR_HOME/saur.conf" <<EOF
+# SAUR configuration (bash). Overrides: saur.local.conf, then SAUR_* env vars.
+SAUR_NAME=$SAUR_NAME
+SAUR_ORG=$SAUR_ORG
+SAUR_ARCH=$SAUR_ARCH
+SAUR_URL=http://$(hostname):$SAUR_PORT
+SAUR_MIRRORS=''
+EOF
+  touch "$SAUR_HOME/repos.extra" "$SAUR_HOME/repos.ignore"
+  ok "initialized $SAUR_HOME"
+}
+
+cmd_clean() {
+  case ${1:-} in -h|--help) help_cmd clean; exit 0 ;; esac
+  rm -rf "$WORK/src" "$WORK/pkgdest" "$LOGS"
+  if [[ ${1:-} == --all ]]; then rm -rf "$WORK"; fi
+  ok "cleaned $WORK"
+}
+
+# ---------------------------------------------------------------------------
+# Help and completion
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+${B}saur${R} ${D}$SAUR_VERSION${R} · build, publish and serve SAUR (Szmelc AUR)
+
+${B}USAGE${R}
+  saur [global flags] <command> [flags]
+
+${B}COMMANDS${R}
+  ${CYN}run${R}         scan, build what changed, then generate the site ${D}(what CI and the timer call)${R}
+  ${CYN}build${R}       scan and build what changed, update the repo database
+  ${CYN}scan${R}        show every source repo and what would happen to it
+  ${CYN}site${R}        write index.html, packages.json and the one-time 'add' script
+  ${CYN}list${R}        list packages in the repository
+  ${CYN}status${R}      per-repo build state (ok / failed / no PKGBUILD)
+  ${CYN}serve${R}       serve the repository over HTTP
+  ${CYN}release${R}     pull|push packages to the GitHub release used as storage
+  ${CYN}timer${R}       install|remove|status systemd user units (nightly build + server)
+  ${CYN}extra${R}       ls|add|rm repos outside the org
+  ${CYN}config${R}      print the effective configuration
+  ${CYN}doctor${R}      check required tools
+  ${CYN}init${R}        create a config for a self-hosted instance
+  ${CYN}clean${R}       remove build leftovers
+  ${CYN}completion${R}  print shell completion (bash|zsh|fish)
+
+${B}GLOBAL FLAGS${R}
+  -H, --home DIR   SAUR home (config, state, output)  ${D}[\$SAUR_HOME]${R}
+  -q, --quiet      only warnings and errors
+      --no-color   disable colors  ${D}[\$NO_COLOR]${R}
+  -V, --version    print version
+  -h, --help       this help; ${B}saur help <command>${R} for details
+EOF
+}
+
+help_cmd() {
+  case ${1:-} in
+    run|build) cat <<EOF
+${B}saur $1${R} [flags] [REPO...]
+
+Scan the org (and repos.extra), clone each repo whose HEAD moved, build every
+PKGBUILD it holds and update the database. Failures are isolated per package and
+retried only when the repo changes. ${B}run${R} also regenerates the site.
+Without --native this runs inside an Arch container (docker/podman).
+
+  -f, --force         rebuild everything (or every matched REPO)
+  -r, --retry-failed  retry failed packages even if unchanged
+  -n, --dry-run       only print what would be built
+      --native        build on this machine (Arch, as root: CI/containers)
+      --container     always use a container
+  REPO                limit to matching repos (name, owner/name or substring)
+EOF
+    ;;
+    scan) printf '%s\n' "${B}saur scan${R} [--json] [REPO...]" "" "List all sources with their HEAD, last state and planned action." ;;
+    site) printf '%s\n' "${B}saur site${R}" "" "Write index.html, packages.json, packages.txt and the 'add' script into SAUR_OUT." ;;
+    list) printf '%s\n' "${B}saur list${R} [--json]" "" "List packages in the repository database." ;;
+    status) printf '%s\n' "${B}saur status${R} [--json]" "" "Show build state per source repo." ;;
+    serve) printf '%s\n' "${B}saur serve${R} [-p PORT] [-b ADDR]" "" "Serve SAUR_OUT over HTTP (darkhttpd, python3 or busybox)." ;;
+    release) printf '%s\n' "${B}saur release${R} pull|push" "" "pull: download all packages from the GitHub release into SAUR_OUT." "push: upload new packages and the db, delete stale assets. Needs gh." ;;
+    timer) printf '%s\n' "${B}saur timer${R} install|remove|status [--at CALENDAR] [-p PORT]" "" "Self-hosting: a systemd user timer for 'saur run' (default midnight)" "and a service running 'saur serve'." ;;
+    extra) printf '%s\n' "${B}saur extra${R} ls|add|rm [OWNER/REPO[@branch] | URL[@branch]]" "" "Manage repos.extra: repos built in addition to the org." ;;
+    config) printf '%s\n' "${B}saur config${R} [--json]" "" "Print the effective configuration (defaults < saur.conf < saur.local.conf < env)." ;;
+    doctor) printf '%s\n' "${B}saur doctor${R}" "" "Check the tools SAUR needs." ;;
+    init) printf '%s\n' "${B}saur init${R}" "" "Create saur.conf, repos.extra and repos.ignore in SAUR_HOME." ;;
+    clean) printf '%s\n' "${B}saur clean${R} [--all]" "" "Remove clones and logs (--all: the whole work dir, incl. pacman cache)." ;;
+    completion) printf '%s\n' "${B}saur completion${R} bash|zsh|fish" "" "Print a completion script. Example: saur completion zsh > ~/.zfunc/_saur" ;;
+    ''|help) usage ;;
+    *) die "unknown command: $1" ;;
+  esac
+}
+
+cmd_completion() {
+  case ${1:-} in
+    bash) cat <<'EOF'
+# bash completion for saur
+_saur() {
+  local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[1]}
+  if ((COMP_CWORD == 1)); then
+    COMPREPLY=($(compgen -W "run build scan site list status serve release timer extra config doctor init clean completion help version --home --quiet --no-color --version --help" -- "$cur")); return
+  fi
+  case $cmd in
+    run|build) COMPREPLY=($(compgen -W "--force --retry-failed --dry-run --native --container --help" -- "$cur")) ;;
+    scan|list|status|config) COMPREPLY=($(compgen -W "--json --help" -- "$cur")) ;;
+    serve) COMPREPLY=($(compgen -W "--port --bind --help" -- "$cur")) ;;
+    release) COMPREPLY=($(compgen -W "pull push" -- "$cur")) ;;
+    timer) COMPREPLY=($(compgen -W "install remove status --at --port" -- "$cur")) ;;
+    extra) COMPREPLY=($(compgen -W "ls add rm" -- "$cur")) ;;
+    clean) COMPREPLY=($(compgen -W "--all" -- "$cur")) ;;
+    completion) COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
+    help) COMPREPLY=($(compgen -W "run build scan site list status serve release timer extra config doctor init clean completion" -- "$cur")) ;;
+  esac
+}
+complete -F _saur saur
+EOF
+    ;;
+    zsh) cat <<'EOF'
+#compdef saur
+_saur() {
+  local -a cmds
+  cmds=(
+    'run:scan, build what changed, generate the site'
+    'build:scan and build what changed'
+    'scan:show sources and planned actions'
+    'site:generate index.html, packages.json and the add script'
+    'list:list packages in the repository'
+    'status:per-repo build state'
+    'serve:serve the repository over HTTP'
+    'release:pull or push the GitHub release storage'
+    'timer:manage systemd user units'
+    'extra:manage repos outside the org'
+    'config:print the effective configuration'
+    'doctor:check required tools'
+    'init:create a self-hosting config'
+    'clean:remove build leftovers'
+    'completion:print shell completion'
+    'help:show help'
+    'version:print version'
+  )
+  _arguments -C \
+    '(-H --home)'{-H,--home}'[SAUR home]:dir:_directories' \
+    '(-q --quiet)'{-q,--quiet}'[only warnings and errors]' \
+    '--no-color[disable colors]' \
+    '(-V --version)'{-V,--version}'[print version]' \
+    '(-h --help)'{-h,--help}'[show help]' \
+    '1:command:->cmd' '*::arg:->args'
+  case $state in
+    cmd) _describe command cmds ;;
+    args)
+      case $words[1] in
+        run|build) _arguments '(-f --force)'{-f,--force}'[rebuild everything]' '(-r --retry-failed)'{-r,--retry-failed}'[retry failed]' \
+          '(-n --dry-run)'{-n,--dry-run}'[only print the plan]' '--native[build on this machine]' '--container[use a container]' '*:repo:' ;;
+        scan|list|status|config) _arguments '--json[JSON output]' ;;
+        serve) _arguments '(-p --port)'{-p,--port}'[port]:port:' '(-b --bind)'{-b,--bind}'[address]:addr:' ;;
+        release) _values action pull push ;;
+        timer) _arguments '1:action:(install remove status)' '--at[systemd calendar]:calendar:' '(-p --port)'{-p,--port}'[port]:port:' ;;
+        extra) _arguments '1:action:(ls add rm)' '*:repo:' ;;
+        clean) _arguments '--all[remove the whole work dir]' ;;
+        completion) _values shell bash zsh fish ;;
+        help) _describe command cmds ;;
+      esac ;;
+  esac
+}
+_saur "$@"
+EOF
+    ;;
+    fish) cat <<'EOF'
+# fish completion for saur
+set -l cmds run build scan site list status serve release timer extra config doctor init clean completion help version
+complete -c saur -f
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -s H -l home -r -d 'SAUR home'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -s q -l quiet -d 'Only warnings and errors'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -l no-color -d 'Disable colors'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -s V -l version -d 'Print version'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a run -d 'Scan, build, generate site'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a build -d 'Scan and build what changed'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a scan -d 'Show sources and planned actions'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a site -d 'Generate site files'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a list -d 'List packages'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a status -d 'Per-repo build state'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a serve -d 'Serve over HTTP'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a release -d 'GitHub release storage'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a timer -d 'systemd user units'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a extra -d 'Repos outside the org'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a config -d 'Effective configuration'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a doctor -d 'Check tools'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a init -d 'Create self-hosting config'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a clean -d 'Remove build leftovers'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a completion -d 'Shell completion'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a help -d 'Show help'
+complete -c saur -n "__fish_seen_subcommand_from run build" -s f -l force -d 'Rebuild everything'
+complete -c saur -n "__fish_seen_subcommand_from run build" -s r -l retry-failed -d 'Retry failed'
+complete -c saur -n "__fish_seen_subcommand_from run build" -s n -l dry-run -d 'Only print the plan'
+complete -c saur -n "__fish_seen_subcommand_from run build" -l native -d 'Build on this machine'
+complete -c saur -n "__fish_seen_subcommand_from run build" -l container -d 'Use a container'
+complete -c saur -n "__fish_seen_subcommand_from scan list status config" -l json -d 'JSON output'
+complete -c saur -n "__fish_seen_subcommand_from serve" -s p -l port -r -d 'Port'
+complete -c saur -n "__fish_seen_subcommand_from serve" -s b -l bind -r -d 'Address'
+complete -c saur -n "__fish_seen_subcommand_from release" -a 'pull push'
+complete -c saur -n "__fish_seen_subcommand_from timer" -a 'install remove status'
+complete -c saur -n "__fish_seen_subcommand_from extra" -a 'ls add rm'
+complete -c saur -n "__fish_seen_subcommand_from clean" -l all -d 'Remove the whole work dir'
+complete -c saur -n "__fish_seen_subcommand_from completion" -a 'bash zsh fish'
+EOF
+    ;;
+    -h|--help) help_cmd completion ;;
+    *) die "usage: saur completion bash|zsh|fish" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  setup_colors
+  while (($#)); do
+    case $1 in
+      -H|--home) SAUR_HOME=$2; shift ;;
+      -q|--quiet) QUIET=1 ;;
+      --no-color) SAUR_NO_COLOR=1; setup_colors ;;
+      -V|--version) echo "saur $SAUR_VERSION"; return ;;
+      -h|--help) usage; return ;;
+      -*) die "unknown flag: $1 (see: saur --help)" ;;
+      *) break ;;
+    esac
+    shift
+  done
+  CMD=${1:-help}
+  shift || true
+  resolve_home; load_config
+  # All paths are absolute now. Leave the checkout so git never trips over its .git
+  # (e.g. a worktree's gitfile pointing at a host path inside a container).
+  cd /
+  case $CMD in
+    run) cmd_run "$@" ;;
+    build) cmd_build "$@" ;;
+    scan) cmd_scan "$@" ;;
+    site) cmd_site "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    status) cmd_status "$@" ;;
+    serve) cmd_serve "$@" ;;
+    release) cmd_release "$@" ;;
+    timer) cmd_timer "$@" ;;
+    extra) cmd_extra "$@" ;;
+    config) cmd_config "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    init) cmd_init "$@" ;;
+    clean) cmd_clean "$@" ;;
+    completion) cmd_completion "$@" ;;
+    help) help_cmd "${1:-}" ;;
+    version) echo "saur $SAUR_VERSION" ;;
+    *) die "unknown command: $CMD (see: saur --help)" ;;
+  esac
+}
+
+main "$@"

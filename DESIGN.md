@@ -1,0 +1,8 @@
+# SAUR (Szmelc AUR)
+> Arch User Repository of Szmelc.INC
+> Main mirror hosted and built by pipelines on GitHub (under Szmelc-INC).
+> It should automatically detect code updates in projects (by comparing PKGBUILD's, either automatically or every X timeframe (every 24h at midnight seems also ok), and it should scan all repos on Szmelc-INC and if there is a new version of a project (repo with PKGBUILD inside), it builds it and pushes automatically, so users can get and download fresh versions of any software Im building, and they don't have to rely on my faulty memory and lack of time to do that.
+> It should also have a maximally short and simple URL to the AUR (to put in pacman.conf), for the aesthetic and visual reasons (makes it simpler).
+> It should also have a README.md in which there is a simple short one-liner command on top to add it to pacman.conf and refresh (sudo pacman -Syy) and after that it prints a welcome message and gives snippets to paste to list all szmelc software available to browse for something cool. (but this shows only ONCE on adding the repo, very short and kind message, and will never ever bother anyone again)
+> It should auto-scan all repos on Szmelc-INC looking for a project to build, and let me add few extra outside repos (from my personal account etc) manually to a manual list too.
+> It should also be free forever, so GitHub won't charge me for those automated pipelines one day... (now they offer some free usage i think, so should be possible) but in case they ever go full nuts and start charging for every compute they can, I want you to write a bash script that can be used on any PC to build and serve it like on GitHub, and it will be just in case i need it one day.
