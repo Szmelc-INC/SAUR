@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SAUR_VERSION=0.2.0
+SAUR_VERSION=0.2.1
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 # ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ table() {
 # ---------------------------------------------------------------------------
 CONFIG_VARS=(SAUR_NAME SAUR_EX_SUFFIX SAUR_ORG SAUR_ARCH SAUR_URL SAUR_MIRRORS SAUR_GH_REPO SAUR_INCLUDE_FORKS
   SAUR_INCLUDE_ARCHIVED SAUR_INCLUDE_PRIVATE SAUR_IGNORE_PATHS SAUR_ALL_BRANCHES SAUR_IGNORE_BRANCHES
-  SAUR_BUILD_TIMEOUT SAUR_NOCHECK
+  SAUR_BUILD_TIMEOUT SAUR_NOCHECK SAUR_COLOR SAUR_EX_COLOR
   SAUR_IMAGE SAUR_ENGINE SAUR_PACKAGER SAUR_WORK SAUR_OUT SAUR_STATE SAUR_PORT SAUR_JOBS)
 
 resolve_home() {
@@ -71,6 +71,7 @@ load_config() {
   SAUR_IGNORE_PATHS='(^|/)(tests?|testdata|examples?|vendor|node_modules|third_party)/'
   SAUR_ALL_BRANCHES=1 SAUR_IGNORE_BRANCHES='^(dependabot|renovate)/|^gh-pages$'
   SAUR_BUILD_TIMEOUT=3600 SAUR_NOCHECK=0
+  SAUR_COLOR=#105c5c SAUR_EX_COLOR=#750f0f
   SAUR_IMAGE=docker.io/library/archlinux:base-devel SAUR_ENGINE=
   SAUR_PACKAGER='SAUR <https://github.com/Szmelc-INC/SAUR>'
   SAUR_WORK=work SAUR_OUT=public SAUR_STATE=state SAUR_PORT=8080 SAUR_JOBS=8
@@ -1017,14 +1018,23 @@ EOF
   chmod 755 "$1"
 }
 
+# A #rrggbb color from the config, or the default when it is anything else (it lands in CSS).
+site_color() { # var default
+  if [[ ${!1} =~ ^#[0-9a-fA-F]{6}$ ]]; then printf '%s' "${!1}"
+  else warn "$1='${!1}' is not #rrggbb, using $2"; printf '%s' "$2"; fi
+}
+
 cmd_site() {
   if [[ ${1:-} == -h || ${1:-} == --help ]]; then help_cmd site; exit 0; fi
   db_init; db_materialize
   step "Generating site in $OUT"
   local recs; recs=$(db_records_all)
+  # branch/commit come from the "[experimental: branch@sha]" tag build_dir appends to the description.
   jq -R -s --arg arch "$ARCH" 'split("\n") | map(select(length > 0) | split("\t")
+      | ([.[3] | capture("\\[experimental: (?<b>.+)@(?<c>[0-9a-f]+)\\]$")] | first) as $src
       | {name: .[1], version: .[2], description: (.[3] | sub("^ $"; "")), channel: .[0], filename: .[4],
          size: (.[5] | tonumber? // 0), builddate: (.[6] | tonumber? // 0), url: .[7], arch: .[8],
+         branch: ($src.b // null), commit: ($src.c // null),
          download: ($arch + "/" + .[4])})' \
     <<<"$recs" >"$OUT/packages.json"
   local exrepo strepo
@@ -1034,12 +1044,26 @@ cmd_site() {
   write_add_script "$OUT/add" 0
   write_add_script "$OUT/add-ex" 1
 
-  local rows='' ch n v desc fn csz u
+  local color excolor
+  color=$(site_color SAUR_COLOR '#105c5c') excolor=$(site_color SAUR_EX_COLOR '#750f0f')
+  local rows='' ch n v desc fn csz bd u repo src built
   if [[ -n $recs ]]; then
-    rows=$(while IFS=$'\t' read -r ch n v desc fn csz _ u _; do
-      printf '<tr data-ch="%s"><td><a href="%s">%s</a></td><td><code>%s</code></td><td><span class="ch %s">%s</span></td><td>%s</td><td class="r">%s</td><td><a href="%s/%s" title="download">pkg</a></td></tr>\n' \
-        "$ch" "$(html_escape <<<"$u")" "$n" "$v" "$ch" "$( [[ $ch == stable ]] && echo "$strepo" || echo "$exrepo")" \
-        "$(html_escape <<<"${desc# }")" "$(numfmt --to=iec "${csz:-0}" 2>/dev/null || echo "$csz")" "$ARCH" "$fn"
+    rows=$(while IFS=$'\t' read -r ch n v desc fn csz bd u _; do
+      desc=${desc# } src=
+      if [[ $desc =~ ^(.*[^[:space:]])?[[:space:]]*\[experimental:\ ([^]]+)\]$ ]]; then
+        desc=${BASH_REMATCH[1]} src=${BASH_REMATCH[2]}
+      fi
+      if [[ $ch == stable ]]; then repo=$strepo; else repo=$exrepo; fi
+      built=$(date -u -d "@${bd:-0}" +%F 2>/dev/null || echo -)
+      n=$(html_escape <<<"$n")
+      printf '<tr data-ch="%s"><td class="pkg"><a href="%s">%s</a>%s</td><td class="ver"><code>%s</code></td>' \
+        "$ch" "$(html_escape <<<"$u")" "$n" \
+        "$( [[ -n $src ]] && printf '<span class="src" title="experimental build of this branch@commit">%s</span>' "$(html_escape <<<"$src")")" \
+        "$(html_escape <<<"$v")"
+      printf '<td class="repo"><span class="ch %s">%s</span></td><td class="desc">%s</td><td class="r">%s</td><td class="r">%s</td>' \
+        "$ch" "$repo" "$(html_escape <<<"$desc")" "$built" "$(numfmt --to=iec "${csz:-0}" 2>/dev/null || echo "$csz")"
+      printf '<td class="act"><button class="cp" data-cp="sudo pacman -S %s/%s" title="copy: sudo pacman -S %s/%s">install</button><a href="%s/%s" title="download the package file">pkg</a></td></tr>\n' \
+        "$repo" "$n" "$repo" "$n" "$ARCH" "$(html_escape <<<"$fn")"
     done <<<"$recs")
   fi
   local count st_n ex_n
@@ -1047,6 +1071,7 @@ cmd_site() {
   st_n=$(grep -c '^stable' <<<"$recs" || true)
   ex_n=$(grep -c '^experimental' <<<"$recs" || true)
   local updated; updated=$(date -u '+%Y-%m-%d %H:%M UTC')
+  # Unquoted heredoc: keep backticks and dollar-brace out of the CSS and JS below.
   cat >"$OUT/index.html" <<EOF
 <!doctype html>
 <html lang="en">
@@ -1055,67 +1080,130 @@ cmd_site() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Szmelc AUR</title>
 <meta name="description" content="Szmelc AUR (SAUR): pacman repository of Szmelc.INC software, rebuilt automatically from git.">
+<meta name="theme-color" content="${color}">
 <style>
-:root { --bg:#fbfaf8; --fg:#1d1b20; --mute:#6b6670; --line:#e6e2dd; --acc:#7a1fd1; --code:#f1eeea; --st:#1c7c54; --ex:#b4530a; }
-@media (prefers-color-scheme: dark) { :root { --bg:#141216; --fg:#ece8ef; --mute:#9a94a0; --line:#2b2730; --acc:#c08bff; --code:#1f1c23; --st:#5fd3a0; --ex:#ffae5c; } }
-* { box-sizing: border-box; }
-body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 ui-sans-serif,system-ui,sans-serif; }
-main { max-width:980px; margin:0 auto; padding:40px 16px 64px; }
-h1 { font-size:28px; margin:0 0 4px; letter-spacing:-.01em; } h1 span { color:var(--acc); }
+:root { --brand:${color}; --brand-ex:${excolor}; --bg:#f7f9f9; --fg:#161c1c; --mute:#5e6868; --line:#dfe6e6; --code:#edf2f2; --tint:0%; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0e1213; --fg:#e6eded; --mute:#93a0a0; --line:#243030; --code:#161d1e; --tint:55%; } }
+body { --acc:var(--brand); }
+body[data-tab="experimental"] { --acc:var(--brand-ex); }
+body { --acc-t:color-mix(in srgb, var(--acc), white var(--tint)); --st-t:color-mix(in srgb, var(--brand), white var(--tint)); --ex-t:color-mix(in srgb, var(--brand-ex), white var(--tint)); }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 ui-sans-serif,system-ui,sans-serif; border-top:5px solid var(--acc); transition:border-color .2s; }
+main { max-width:1040px; margin:0 auto; padding:36px 16px 64px; }
+h1 { font-size:30px; margin:0 0 6px; letter-spacing:-.01em; } h1 span { color:var(--acc-t); transition:color .2s; }
 h1 small { font-size:15px; color:var(--mute); font-weight:500; }
-p { color:var(--mute); margin:0 0 12px; }
-pre { background:var(--code); border:1px solid var(--line); border-radius:8px; padding:12px 14px; overflow-x:auto; margin:0 0 20px; }
+p { color:var(--mute); margin:0 0 12px; } p b { color:var(--fg); }
+.cmd { position:relative; margin:0 0 16px; }
+pre { background:var(--code); border:1px solid var(--line); border-left:3px solid var(--acc); border-radius:8px; padding:12px 72px 12px 14px; overflow-x:auto; margin:0; }
 code, pre { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
-.bar { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0 12px; }
-.bar input { flex:1 1 220px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; font:inherit; }
-.bar button { padding:8px 12px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; font:inherit; cursor:pointer; }
-.bar button[aria-pressed="true"] { border-color:var(--acc); color:var(--acc); }
+.cmd .cp { position:absolute; top:8px; right:8px; }
+button { font:inherit; color:inherit; cursor:pointer; }
+.cp { padding:2px 8px; font-size:12px; border:1px solid var(--line); border-radius:6px; background:var(--bg); }
+.cp:hover { border-color:var(--acc); color:var(--acc-t); }
+.cp.done { background:var(--acc); border-color:var(--acc); color:#fff; }
+.tabs { display:flex; gap:6px; overflow-x:auto; margin:28px 0 0; border-bottom:2px solid var(--acc); transition:border-color .2s; }
+.tab { flex:none; padding:9px 16px; border:1px solid var(--line); border-bottom:0; border-radius:8px 8px 0 0; background:transparent; font-weight:600; }
+.tab small { font-weight:500; color:var(--mute); margin-left:4px; }
+.tab[aria-selected="true"] { background:var(--acc); border-color:var(--acc); color:#fff; }
+.tab[aria-selected="true"] small { color:#ffffffc0; }
+.panel { padding:16px 0 0; }
+.s, .x { display:none; }
+body[data-tab="stable"] .s, body[data-tab="experimental"] .x, body[data-tab="all"] .s, body[data-tab="all"] .x { display:block; }
+.bar { display:flex; gap:8px; margin:4px 0 12px; }
+.bar input { flex:1; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; font:inherit; }
+.bar input:focus { outline:2px solid var(--acc); outline-offset:-1px; }
 .wrap { overflow-x:auto; }
 table { width:100%; border-collapse:collapse; }
-th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
 th { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mute); font-weight:600; }
-td.r { text-align:right; white-space:nowrap; color:var(--mute); }
-.ch { font:12px ui-monospace,monospace; white-space:nowrap; }
-.ch.stable { color:var(--st); } .ch.experimental { color:var(--ex); }
-a { color:var(--acc); text-decoration:none; } a:hover { text-decoration:underline; }
+tbody tr:hover { background:color-mix(in srgb, var(--acc) 7%, transparent); }
+td.r, th.r { text-align:right; white-space:nowrap; color:var(--mute); }
+td.pkg a { font-weight:600; white-space:nowrap; } td.ver code { white-space:nowrap; }
+.repo { display:none; } body[data-tab="all"] .repo { display:table-cell; }
+.ch { font:12px ui-monospace,monospace; white-space:nowrap; padding:1px 7px; border-radius:99px; color:#fff; }
+.ch.stable { background:var(--brand); } .ch.experimental { background:var(--brand-ex); }
+.src { display:block; width:max-content; margin-top:3px; font:12px ui-monospace,monospace; color:var(--ex-t); border:1px solid color-mix(in srgb, var(--brand-ex) 45%, transparent); border-radius:6px; padding:0 6px; }
+.act { white-space:nowrap; } .act a { margin-left:8px; font-size:13px; }
+.empty { display:none; padding:28px 10px; text-align:center; }
+a { color:var(--acc-t); text-decoration:none; } a:hover { text-decoration:underline; }
 footer { margin-top:28px; color:var(--mute); font-size:13px; }
+@media (max-width:640px) {
+  main { padding-top:24px; } h1 { font-size:26px; }
+  .tab { padding:8px 11px; } .tab .rn { display:none; }
+  pre { white-space:pre-wrap; word-break:break-all; }
+  thead { display:none; }
+  #rows tr { display:flex; flex-wrap:wrap; align-items:baseline; gap:2px 12px; padding:10px 2px; border-bottom:1px solid var(--line); }
+  #rows tr[hidden] { display:none; }
+  #rows td { padding:0; border:0; }
+  td.pkg { order:1; flex:1 1 auto; } td.act { order:2; }
+  td.desc { order:3; flex-basis:100%; }
+  td.ver, td.repo, td.r { order:4; font-size:12px; color:var(--mute); }
+}
 </style>
 </head>
-<body>
+<body data-tab="all">
 <main>
 <h1><span>Szmelc AUR</span> <small>SAUR</small></h1>
-<p>${count} packages from Szmelc.INC, rebuilt automatically whenever their source changes: ${st_n} in <b>[${strepo}]</b> (stable, default branches) and ${ex_n} in <b>[${exrepo}]</b> (experimental, side branches, named <code>*${SAUR_EX_SUFFIX}</code> so they install next to the stable ones).</p>
-<p>Add the stable repo once:</p>
-<pre>curl -fsSL ${SAUR_URL}/add | sudo bash</pre>
-<p>Or stable and experimental together:</p>
-<pre>curl -fsSL ${SAUR_URL}/add-ex | sudo bash</pre>
-<div class="bar">
-<input id="q" type="search" placeholder="Filter packages…" aria-label="Filter packages">
-<button data-f="all" aria-pressed="true">All</button>
-<button data-f="stable" aria-pressed="false">Stable</button>
-<button data-f="experimental" aria-pressed="false">Experimental</button>
+<p>${count} packages from Szmelc.INC, rebuilt automatically whenever their source changes.</p>
+<div class="tabs" role="tablist" aria-label="Channel">
+<button class="tab" role="tab" data-f="stable" aria-selected="false">Stable<small><span class="rn">[${strepo}] </span>${st_n}</small></button>
+<button class="tab" role="tab" data-f="experimental" aria-selected="false">Experimental<small><span class="rn">[${exrepo}] </span>${ex_n}</small></button>
+<button class="tab" role="tab" data-f="all" aria-selected="true">All<small>${count}</small></button>
 </div>
+<div class="panel">
+<div class="s">
+<p><b>[${strepo}]</b> is the stable channel: the default branch of every repo. Add it once:</p>
+<div class="cmd"><pre>curl -fsSL ${SAUR_URL}/add | sudo bash</pre><button class="cp" data-cp="curl -fsSL ${SAUR_URL}/add | sudo bash">copy</button></div>
+</div>
+<div class="x">
+<p><b>[${exrepo}]</b> is the experimental channel: every other branch, work in progress. Packages, commands and man pages end in <code>${SAUR_EX_SUFFIX}</code>, so they install next to the stable ones. Add both channels:</p>
+<div class="cmd"><pre>curl -fsSL ${SAUR_URL}/add-ex | sudo bash</pre><button class="cp" data-cp="curl -fsSL ${SAUR_URL}/add-ex | sudo bash">copy</button></div>
+</div>
+<div class="bar"><input id="q" type="search" placeholder="Filter packages…" aria-label="Filter packages"></div>
 <div class="wrap"><table>
-<thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Description</th><th class="r">Size</th><th></th></tr></thead>
+<thead><tr><th>Package</th><th>Version</th><th class="repo">Repo</th><th>Description</th><th class="r">Built</th><th class="r">Size</th><th></th></tr></thead>
 <tbody id="rows">
 ${rows}
-</tbody></table></div>
+</tbody></table>
+<p class="empty" id="empty">Nothing here yet.</p></div>
+</div>
 <footer>Updated ${updated} · <a href="packages.json">packages.json</a> · <a href="packages.txt">packages.txt</a> · <a href="https://github.com/${SAUR_GH_REPO}">source</a></footer>
 </main>
 <script>
-const q = document.getElementById('q');
-let ch = 'all';
+const q = document.getElementById('q'), empty = document.getElementById('empty');
+const tabs = document.querySelectorAll('.tab');
+let ch = 'stable';
 const apply = () => {
   const s = q.value.toLowerCase();
-  for (const tr of document.querySelectorAll('#rows tr'))
+  let shown = 0;
+  for (const tr of document.querySelectorAll('#rows tr')) {
     tr.hidden = !tr.textContent.toLowerCase().includes(s) || (ch !== 'all' && tr.dataset.ch !== ch);
+    if (!tr.hidden) shown++;
+  }
+  empty.style.display = shown ? 'none' : 'block';
+  document.querySelector('thead').hidden = !shown;
+  empty.textContent = s ? 'No packages match "' + q.value + '".' : 'No ' + ch + ' packages right now.';
 };
-q.addEventListener('input', apply);
-for (const b of document.querySelectorAll('.bar button')) b.addEventListener('click', () => {
-  ch = b.dataset.f;
-  for (const o of document.querySelectorAll('.bar button')) o.setAttribute('aria-pressed', String(o === b));
+const select = (f) => {
+  if (!['stable', 'experimental', 'all'].includes(f)) f = 'stable';
+  ch = f;
+  document.body.dataset.tab = f;
+  for (const t of tabs) t.setAttribute('aria-selected', String(t.dataset.f === f));
   apply();
+};
+for (const t of tabs) t.addEventListener('click', () => { history.replaceState(null, '', '#' + t.dataset.f); select(t.dataset.f); });
+window.addEventListener('hashchange', () => select(location.hash.slice(1)));
+q.addEventListener('input', apply);
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('.cp');
+  if (!b || !navigator.clipboard) return;
+  navigator.clipboard.writeText(b.dataset.cp).then(() => {
+    const label = b.textContent;
+    b.textContent = 'copied'; b.classList.add('done');
+    setTimeout(() => { b.textContent = label; b.classList.remove('done'); }, 1200);
+  });
 });
+select(location.hash.slice(1));
 </script>
 </body>
 </html>
@@ -1480,7 +1568,9 @@ ${B}Channels${R}
 EOF
     ;;
     scan) printf '%s\n' "${B}saur scan${R} [--json] [REPO...]" "" "List all sources (one per repo branch) with HEAD, last state and planned action." ;;
-    site) printf '%s\n' "${B}saur site${R}" "" "Write index.html, packages.json, packages.txt and the add/add-ex scripts into SAUR_OUT." ;;
+    site) printf '%s\n' "${B}saur site${R}" "" "Write index.html, packages.json, packages.txt and the add/add-ex scripts into SAUR_OUT." \
+      "index.html has Stable / Experimental / All tabs (link one with #stable, #experimental, #all)," \
+      "colored with SAUR_COLOR (stable, default #105c5c) and SAUR_EX_COLOR (experimental, default #750f0f)." ;;
     list) printf '%s\n' "${B}saur list${R} [-s|--stable] [-x|--ex] [-c|--channel stable|experimental|all] [--json]" "" "List packages of both channels (or one)." ;;
     status) printf '%s\n' "${B}saur status${R} [--json]" "" "Show build state and channel per source (repo or repo#branch)." ;;
     serve) printf '%s\n' "${B}saur serve${R} [-p PORT] [-b ADDR]" "" "Serve SAUR_OUT over HTTP (darkhttpd, python3 or busybox)." ;;
