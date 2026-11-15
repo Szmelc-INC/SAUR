@@ -1,5 +1,6 @@
 # Repos built in addition to everything in SAUR_ORG. One per line:
-#   owner/repo            GitHub repo, default branch
-#   owner/repo@branch     specific branch
-#   https://host/x.git    any git URL (optionally @branch)
-# Or: saur extra add owner/repo
+#   owner/repo                  GitHub repo, every branch (default -> stable, others -> experimental)
+#   owner/repo@branch           only this branch, treated as the repo's main source (stable)
+#   https://host/x.git          any git URL (optionally @branch)
+#   owner/repo@dev experimental force a channel: stable | experimental (a PKGBUILD's _saur_channel wins)
+# Or: saur extra add [--ex|--stable] owner/repo

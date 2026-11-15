@@ -1,11 +1,11 @@
 # Maintainer: SilverX <serainox@gmail.com>
 #
-# Packages the SAUR tool from the checkout this PKGBUILD lives in, so SAUR
+# Packages the Szmelc AUR (SAUR) tool from the checkout this PKGBUILD lives in, so SAUR
 # publishes itself: cd packaging && makepkg -si
 pkgname=saur
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
-pkgdesc="Build, publish and serve SAUR: a self-updating pacman repository built from PKGBUILDs in git repos"
+pkgdesc="Build, publish and serve Szmelc AUR (SAUR): a self-updating pacman repository with stable and experimental channels"
 arch=('any')
 url="https://github.com/Szmelc-INC/SAUR"
 license=('MIT')
