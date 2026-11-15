@@ -1,0 +1,5 @@
+# Repos built in addition to everything in SAUR_ORG. One per line:
+#   owner/repo            GitHub repo, default branch
+#   owner/repo@branch     specific branch
+#   https://host/x.git    any git URL (optionally @branch)
+# Or: saur extra add owner/repo

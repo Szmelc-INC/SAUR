@@ -1,0 +1,8 @@
+/work/
+/public/
+/state/
+/saur.local.conf
+/result
+/packaging/src/
+/packaging/pkg/
+/packaging/*.pkg.tar.*

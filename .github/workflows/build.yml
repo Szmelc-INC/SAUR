@@ -1,0 +1,101 @@
+name: build
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # nightly, 00:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild everything (or every repo listed below)
+        type: boolean
+        default: false
+      repos:
+        description: Only these repos (space separated, e.g. "cdvd PackerMax")
+        type: string
+        default: ''
+  repository_dispatch:
+    types: [saur-rebuild] # instant rebuild, see README "Rebuild on push"
+  push:
+    paths:
+      - bin/**
+      - saur.conf
+      - repos.*
+      - .github/workflows/build.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: saur-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Only the default branch publishes; other branches just prove the build works.
+      PUBLISH: ${{ github.ref == 'refs/heads/main' }}
+    outputs:
+      deploy: ${{ steps.run.outputs.changed == 'true' || github.event_name != 'schedule' }}
+    steps:
+      - name: Bootstrap
+        run: pacman -Syu --noconfirm --needed git jq curl github-cli
+
+      - uses: actions/checkout@v4
+
+      - name: Trust workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Restore published packages
+        if: env.PUBLISH == 'true'
+        run: bin/saur release pull
+
+      - name: Build
+        id: run
+        env:
+          FORCE: ${{ inputs.force && '--force' || '' }}
+          REPOS: ${{ inputs.repos || github.event.client_payload.repos || '' }}
+        # shellcheck disable=SC2086
+        run: bin/saur run --native $FORCE $REPOS
+
+      - name: Upload packages to release
+        if: env.PUBLISH == 'true' && steps.run.outputs.changed == 'true'
+        run: bin/saur release push
+
+      # Build state lives in the release (saur-state.tsv), never in git: a nightly state
+      # commit would move this repo's HEAD and make SAUR rebuild itself every night.
+      # Scheduled workflows stop after 60 days without repo activity, hence a rare heartbeat.
+      - name: Heartbeat
+        if: env.PUBLISH == 'true'
+        run: |
+          if (( $(date +%s) - $(git log -1 --format=%ct) > 45 * 86400 )); then
+            git config user.name 'saur-bot'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            date -u +%FT%TZ > .github/heartbeat
+            git add .github/heartbeat
+            git commit -m "heartbeat: keep the nightly schedule alive"
+            git push
+          fi
+
+      - name: Upload site
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && needs.build.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
