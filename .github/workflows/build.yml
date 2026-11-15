@@ -79,13 +79,13 @@ jobs:
           sed -i '/^\[saur/,$d' /etc/pacman.conf   # the build's own file:// stanzas
           SAUR_URL="file://$PWD/public" SAUR_MIRRORS='' bin/saur site
           bash public/add-ex 2>&1 | tee /tmp/first
-          ! grep -q 'missing required signature' /tmp/first
+          if grep -q 'missing required signature' /tmp/first; then exit 1; fi
           grep -q '^  Web:  *file://' /tmp/first
           grep -A1 '^\[saur' /etc/pacman.conf | grep -c 'SigLevel = Required' | grep -qx 2
           pacman -Sw --noconfirm saur/saur
           sed -i 's/^SigLevel = Required$/SigLevel = Optional TrustAll/' /etc/pacman.conf
           bash public/add-ex 2>&1 | tee /tmp/again
-          ! grep -q 'missing required signature' /tmp/again
+          if grep -q 'missing required signature' /tmp/again; then exit 1; fi
           grep -q 'now SigLevel = Required' /tmp/again
           bash public/add-ex | grep -q 'already set up'
           printf x >>public/x86_64/saur.db.tar.gz
