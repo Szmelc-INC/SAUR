@@ -47,7 +47,9 @@ pacman -Si $(pacman -Slq saur)                        # details
 pacman -Slq saur | fzf --preview 'pacman -Si saur/{}' | xargs -ro sudo pacman -S
 ```
 
-Or open the web list at <https://szmelc-inc.github.io/SAUR>. Machine-readable lists live at [`packages.json`](https://szmelc-inc.github.io/SAUR/packages.json) and [`packages.txt`](https://szmelc-inc.github.io/SAUR/packages.txt).
+Or browse <https://szmelc-inc.github.io/SAUR>. It has a tab per channel, and you can link straight to one: [#stable](https://szmelc-inc.github.io/SAUR/#stable), [#experimental](https://szmelc-inc.github.io/SAUR/#experimental) or [#all](https://szmelc-inc.github.io/SAUR/#all). Every row has a copy-ready `pacman -S` line, the build date and, for experimental builds, the branch and commit they come from. The page uses Szmelc dirty cyan (`SAUR_COLOR`, `#105c5c`) and switches to dark red (`SAUR_EX_COLOR`, `#750f0f`) on the experimental tab.
+
+Machine-readable lists live at [`packages.json`](https://szmelc-inc.github.io/SAUR/packages.json) and [`packages.txt`](https://szmelc-inc.github.io/SAUR/packages.txt). In `packages.json`, experimental entries also carry `branch` and `commit`.
 
 ## Stable and experimental
 

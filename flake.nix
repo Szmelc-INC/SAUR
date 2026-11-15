@@ -12,7 +12,7 @@
       packages = forAll (pkgs: rec {
         saur = pkgs.stdenvNoCC.mkDerivation {
           pname = "saur";
-          version = "0.2.0";
+          version = "0.2.1";
           src = ./.;
           nativeBuildInputs = [ pkgs.makeWrapper pkgs.installShellFiles ];
           dontBuild = true;
