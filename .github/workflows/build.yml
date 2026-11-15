@@ -20,6 +20,7 @@ on:
       - bin/**
       - saur.conf
       - repos.*
+      - keys/**
       - .github/workflows/build.yml
 
 permissions:
@@ -58,8 +59,38 @@ jobs:
         env:
           FORCE: ${{ inputs.force && '--force' || '' }}
           REPOS: ${{ inputs.repos || github.event.client_payload.repos || '' }}
+          # The signing key (armored secret key). bin/saur takes it out of the environment
+          # first thing, so no PKGBUILD can read it. On main a missing key fails the run:
+          # clients require signatures, so nothing unsigned may ever be published.
+          SAUR_GPG_KEY: ${{ secrets.SAUR_GPG_KEY }}
+          SAUR_SIGN: ${{ github.ref == 'refs/heads/main' && '1' || 'auto' }}
         # shellcheck disable=SC2086
         run: bin/saur run --native $FORCE $REPOS
+
+      - name: Verify signatures
+        run: bin/saur verify
+
+      # Branch runs only: install through pacman exactly like a user would, with the
+      # generated add script and SigLevel = Required, then make sure tampering is caught.
+      - name: Install test (signed repo through pacman)
+        if: env.PUBLISH != 'true'
+        run: |
+          set -x
+          sed -i '/^\[saur/,$d' /etc/pacman.conf   # the build's own file:// stanzas
+          SAUR_URL="file://$PWD/public" SAUR_MIRRORS='' bin/saur site
+          bash public/add-ex 2>&1 | tee /tmp/first
+          if grep -q 'missing required signature' /tmp/first; then exit 1; fi
+          grep -q '^  Web:  *file://' /tmp/first
+          grep -A1 '^\[saur' /etc/pacman.conf | grep -c 'SigLevel = Required' | grep -qx 2
+          pacman -Sw --noconfirm saur/saur
+          sed -i 's/^SigLevel = Required$/SigLevel = Optional TrustAll/' /etc/pacman.conf
+          bash public/add-ex 2>&1 | tee /tmp/again
+          if grep -q 'missing required signature' /tmp/again; then exit 1; fi
+          grep -q 'now SigLevel = Required' /tmp/again
+          bash public/add-ex | grep -q 'already set up'
+          printf x >>public/x86_64/saur.db.tar.gz
+          cp public/x86_64/saur.db.tar.gz public/x86_64/saur.db
+          if pacman -Syy; then echo "tampered database was accepted" >&2; exit 1; fi
 
       - name: Upload packages to release
         if: env.PUBLISH == 'true' && steps.run.outputs.changed == 'true'

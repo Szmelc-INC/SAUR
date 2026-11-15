@@ -6,7 +6,9 @@
 curl -fsSL https://szmelc-inc.github.io/SAUR/add | sudo bash
 ```
 
-That's it. The one-liner adds `[saur]` to `/etc/pacman.conf`, runs `pacman -Syy` and greets you once with a few snippets for browsing. After that it never talks again: plain `pacman -Syu` keeps every Szmelc package fresh.
+That's it. The one-liner trusts the SAUR signing key for pacman, adds `[saur]` to `/etc/pacman.conf` with `SigLevel = Required`, runs `pacman -Syy` and greets you once with a few snippets for browsing. After that it never talks again: plain `pacman -Syu` keeps every Szmelc package fresh, and pacman refuses anything SAUR did not sign.
+
+Added SAUR before it was signed? Run the same one-liner again. It imports the key and switches your existing entries to `SigLevel = Required`, quietly.
 
 Want the experimental builds too (side branches, work in progress)?
 
@@ -15,27 +17,43 @@ curl -fsSL https://szmelc-inc.github.io/SAUR/add-ex | sudo bash
 ```
 
 [![build](https://github.com/Szmelc-INC/SAUR/actions/workflows/build.yml/badge.svg)](https://github.com/Szmelc-INC/SAUR/actions/workflows/build.yml)
-[![packages](https://img.shields.io/badge/browse-packages-8a2be2)](https://szmelc-inc.github.io/SAUR)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![arch: x86_64](https://img.shields.io/badge/arch-x86__64-1793d1?logo=archlinux&logoColor=white)
+[![packages](https://img.shields.io/badge/browse-packages-105c5c)](https://szmelc-inc.github.io/SAUR)
+[![signed](https://img.shields.io/badge/signed-ed25519-7fffd4)](#signed)
+[![license: MIT](https://img.shields.io/badge/license-MIT-c0c0c0.svg)](LICENSE)
+![arch: x86_64](https://img.shields.io/badge/arch-x86__64-105c5c?logo=archlinux&logoColor=white)
 
 <details>
-<summary>Prefer to edit pacman.conf by hand?</summary>
+<summary>Prefer to do it by hand, or read the script first?</summary>
+
+Trust the signing key. Its fingerprint is `C696 31CC 012E 1441 6274 6C48 33AC 2BAB 31E9 EB45`, compare it with the one on [the site](https://szmelc-inc.github.io/SAUR):
+
+```sh
+curl -fsSLO https://szmelc-inc.github.io/SAUR/key.asc
+sudo pacman-key --add key.asc
+sudo pacman-key --lsign-key C69631CC012E144162746C4833AC2BAB31E9EB45
+```
+
+Then add this to `/etc/pacman.conf` and run `sudo pacman -Syy`:
 
 ```ini
 [saur]
-SigLevel = Optional TrustAll
+SigLevel = Required
 Server = https://szmelc-inc.github.io/SAUR/$arch
 Server = https://github.com/Szmelc-INC/SAUR/releases/download/$arch
 
 # optional: experimental channel
 [saur-ex]
-SigLevel = Optional TrustAll
+SigLevel = Required
 Server = https://szmelc-inc.github.io/SAUR/$arch
 Server = https://github.com/Szmelc-INC/SAUR/releases/download/$arch
 ```
 
-Then run `sudo pacman -Syy`.
+Or check the add script's signature before it runs as root:
+
+```sh
+curl -fsSL -O https://szmelc-inc.github.io/SAUR/key.asc -O https://szmelc-inc.github.io/SAUR/add -O https://szmelc-inc.github.io/SAUR/add.asc
+gpg --import key.asc && gpg --verify add.asc add && sudo bash add
+```
 </details>
 
 ## Browse
@@ -47,9 +65,25 @@ pacman -Si $(pacman -Slq saur)                        # details
 pacman -Slq saur | fzf --preview 'pacman -Si saur/{}' | xargs -ro sudo pacman -S
 ```
 
-Or browse <https://szmelc-inc.github.io/SAUR>. It has a tab per channel, and you can link straight to one: [#stable](https://szmelc-inc.github.io/SAUR/#stable), [#experimental](https://szmelc-inc.github.io/SAUR/#experimental) or [#all](https://szmelc-inc.github.io/SAUR/#all). Every row has a copy-ready `pacman -S` line, the build date and, for experimental builds, the branch and commit they come from. The page uses Szmelc dirty cyan (`SAUR_COLOR`, `#105c5c`) and switches to dark red (`SAUR_EX_COLOR`, `#750f0f`) on the experimental tab.
+Or browse <https://szmelc-inc.github.io/SAUR>. It has a tab per channel, and you can link straight to one: [#stable](https://szmelc-inc.github.io/SAUR/#stable), [#experimental](https://szmelc-inc.github.io/SAUR/#experimental) or [#all](https://szmelc-inc.github.io/SAUR/#all). Every row has a copy-ready `pacman -S` line, the build date, the package and its signature and, for experimental builds, the branch and commit they come from. Press `/` to filter, sort by name, newest or size, and follow the links to [szmelc.com](https://szmelc.com), [Szmelc-INC on GitHub](https://github.com/Szmelc-INC), the build log or a new issue.
 
-Machine-readable lists live at [`packages.json`](https://szmelc-inc.github.io/SAUR/packages.json) and [`packages.txt`](https://szmelc-inc.github.io/SAUR/packages.txt). In `packages.json`, experimental entries also carry `branch` and `commit`.
+The page is dark by default (neutral near-black greys, no tint) with a light toggle that it remembers. Colors: Szmelc dirty cyan `#105c5c` is the accent (`SAUR_COLOR`), silver `#c0c0c0` the second one for labels and secondary text (`SAUR_SILVER`), aquamarine `#7fffd4` a rare highlight, only the "signed" badge (`SAUR_AQUA`). The experimental tab switches the accent to dark red `#750f0f` (`SAUR_EX_COLOR`).
+
+Machine-readable lists live at [`packages.json`](https://szmelc-inc.github.io/SAUR/packages.json) and [`packages.txt`](https://szmelc-inc.github.io/SAUR/packages.txt), each with a `.asc` signature. In `packages.json`, every entry says whether it is `signed` and where its `signature` is; experimental entries also carry `branch` and `commit`. New builds show up in the Atom feed [`feed.xml`](https://szmelc-inc.github.io/SAUR/feed.xml).
+
+## Signed
+
+One ed25519 key signs everything SAUR publishes, so there is no doubt what comes from Szmelc.INC:
+
+- every package (the signature is embedded in the database and also sits next to the file as `.sig`),
+- both databases, `saur.db` and `saur-ex.db`, and their `.files`,
+- the add scripts and the package lists: `add.asc`, `add-ex.asc`, `packages.json.asc`, `packages.txt.asc`.
+
+Fingerprint: **`C696 31CC 012E 1441 6274 6C48 33AC 2BAB 31E9 EB45`**. The public key is [`keys/saur.asc`](keys/saur.asc) in this repo and [`key.asc`](https://szmelc-inc.github.io/SAUR/key.asc) on the site. The add script carries it inline, imports it into pacman's keyring and signs it locally (`pacman-key --lsign-key`), so pacman trusts it for SAUR and the key gets no other power. `SigLevel = Required` then makes pacman refuse an unsigned or modified package or database from any mirror.
+
+What a signature proves: the file was built and published by SAUR's own pipeline from Szmelc.INC sources (or `repos.extra`). The secret key lives only in the repo's Actions secret `SAUR_GPG_KEY` and the maintainer's keyring. `bin/saur` takes it out of the environment before any build starts, and PKGBUILD build functions run as an unprivileged user that cannot reach it. Install scripts of build dependencies (which may come from SAUR itself) do run as root in the same container, so push access to a Szmelc-INC repo is, in effect, signing access: guard it like the key. On `main` a run without the key fails instead of publishing unsigned files, and `saur release push` refuses anything that `saur verify` would not pass.
+
+Check a local copy yourself: `saur verify` (all files against `SAUR_KEY`), or `pacman-key --verify saur.db.sig saur.db`.
 
 ## Stable and experimental
 
@@ -132,7 +166,7 @@ jobs:
 
 SAUR is a public repo, and GitHub Actions minutes on public repos are free. Packages live in a Release, and the index lives on Pages. GitHub turns off scheduled workflows after 60 days without repo activity, so the workflow commits a heartbeat when things get quiet.
 
-If GitHub ever starts charging, the same script builds and serves SAUR on any Linux box with docker or podman. Arch is not required:
+If GitHub ever starts charging, the same script builds, signs and serves SAUR on any Linux box with docker or podman. Arch is not required:
 
 ```sh
 git clone https://github.com/Szmelc-INC/SAUR && cd SAUR
@@ -145,6 +179,8 @@ bin/saur timer install  # nightly rebuild at midnight + server, as systemd user 
 
 Not in the `docker` group? Use `SAUR_ENGINE="sudo docker"` or `"pkexec docker"`, or install podman. Point clients at it with `curl -fsSL http://my-box:8080/add | sudo bash`.
 
+Signing works the same away from GitHub: with the SAUR secret key in your gpg keyring (`gpg --import`), `bin/saur run` hands it to the build container by name and signs everything. Your own instance gets its own key with `bin/saur key gen` (writes `keys/saur.asc` and `SAUR_KEY`), and `bin/saur key upload` stores it as the `SAUR_GPG_KEY` secret of `SAUR_GH_REPO`. Without any key the add script falls back to `SigLevel = Optional TrustAll`.
+
 ## The `saur` CLI
 
 | command | what it does |
@@ -155,7 +191,10 @@ Not in the `docker` group? Use `SAUR_ENGINE="sudo docker"` or `"pkexec docker"`,
 | `saur list [-s\|-x] [--json]` | packages of both channels, or only stable (`-s`) / experimental (`-x`) |
 | `saur status [--json]` | ok / failed / idle and channel per source |
 | `saur serve [-p PORT]` | HTTP server for `public/` |
-| `saur release pull\|push` | sync packages with the GitHub release |
+| `saur release pull\|push` | sync packages with the GitHub release (push refuses anything unsigned) |
+| `saur key [show\|export\|gen\|upload]` | the signing key: fingerprint, public key, create one, store it as the CI secret |
+| `saur sign [-f]` | sign every package, database and list that lacks a valid signature |
+| `saur verify [-a] [--json]` | check every signature against `SAUR_KEY`, exit 1 on any problem |
 | `saur timer install\|remove\|status` | systemd user units for self-hosting |
 | `saur extra ls\|add\|rm [--ex\|--stable]` | manage `repos.extra` |
 | `saur config [--json]` · `saur doctor` · `saur init` · `saur clean` | config, checks, setup, cleanup |
@@ -167,7 +206,7 @@ Install the tool itself with `sudo pacman -S saur/saur` once the repo is added, 
 
 ## Limits worth knowing
 
-- Packages are not signed yet, hence `SigLevel = Optional TrustAll`. Signing with a key stored in repo secrets is a small follow-up.
+- Signatures prove where a package comes from, not that its code is safe. Anyone who can push to a Szmelc-INC repo can get a package built and signed.
 - x86_64 only for now. `arch=('any')` packages land there too.
 - GitHub Pages serves up to about 1 GB. That is plenty for scripts and small binaries.
 - Experimental side-by-side install is best effort, see [Stable and experimental](#stable-and-experimental).
