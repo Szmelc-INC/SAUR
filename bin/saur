@@ -5,11 +5,12 @@
 # packages renamed foo -> foo-ex so both install side by side).
 #
 # The same script runs in GitHub Actions and on any PC (via docker/podman),
-# so the repository never depends on one hosting provider.
+# so the repository never depends on one hosting provider. One OpenPGP key signs
+# every package, both databases and the published lists; clients pin its fingerprint.
 set -Eeuo pipefail
 shopt -s nullglob
 
-SAUR_VERSION=0.2.1
+SAUR_VERSION=0.3.0
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 # ---------------------------------------------------------------------------
@@ -17,20 +18,21 @@ SELF=$(readlink -f "${BASH_SOURCE[0]}")
 # ---------------------------------------------------------------------------
 setup_colors() {
   if [[ -z ${NO_COLOR:-} && ${SAUR_NO_COLOR:-0} != 1 ]] && { [[ -t 1 ]] || [[ -n ${GITHUB_ACTIONS:-} ]]; }; then
-    B=$'\e[1m' D=$'\e[90m' R=$'\e[0m' RED=$'\e[31m' GRN=$'\e[32m' YLW=$'\e[33m' BLU=$'\e[34m' MAG=$'\e[35m' CYN=$'\e[36m'
+    B=$'\e[1m' D=$'\e[90m' R=$'\e[0m' RED=$'\e[31m' GRN=$'\e[32m' YLW=$'\e[33m' CYN=$'\e[36m'
     # Brand accents: Szmelc dirty cyan (#105c5c) and experimental red (#750f0f), lifted so they
-    # read on dark and light terminals. 16-color terminals get plain cyan and red.
+    # read on dark and light terminals, and silver (#c0c0c0) as the second accent.
+    # 16-color terminals get plain cyan, red and white.
     if [[ ${COLORTERM:-} == *truecolor* || ${COLORTERM:-} == *24bit* || -n ${GITHUB_ACTIONS:-} ]]; then
-      ACC=$'\e[38;2;31;138;138m' EXC=$'\e[38;2;184;58;58m'
+      ACC=$'\e[38;2;31;138;138m' EXC=$'\e[38;2;184;58;58m' SIL=$'\e[38;2;192;192;192m'
     else
-      ACC=$CYN EXC=$RED
+      ACC=$CYN EXC=$RED SIL=$'\e[37m'
     fi
   else
-    B='' D='' R='' RED='' GRN='' YLW='' BLU='' MAG='' CYN='' ACC='' EXC=''
+    B='' D='' R='' RED='' GRN='' YLW='' CYN='' ACC='' EXC='' SIL=''
   fi
 }
 QUIET=0
-info() { ((QUIET)) || printf '%s::%s %s\n' "$BLU" "$R" "$*" >&2; }
+info() { ((QUIET)) || printf '%s::%s %s\n' "$SIL" "$R" "$*" >&2; }
 ok()   { ((QUIET)) || printf '%s ✓%s %s\n' "$GRN" "$R" "$*" >&2; }
 warn() { printf '%s !!%s %s\n' "$YLW" "$R" "$*" >&2; }
 err()  { printf '%s ✗%s %s\n' "$RED" "$R" "$*" >&2; }
@@ -52,7 +54,8 @@ table() {
 # ---------------------------------------------------------------------------
 CONFIG_VARS=(SAUR_NAME SAUR_EX_SUFFIX SAUR_ORG SAUR_ARCH SAUR_URL SAUR_MIRRORS SAUR_GH_REPO SAUR_INCLUDE_FORKS
   SAUR_INCLUDE_ARCHIVED SAUR_INCLUDE_PRIVATE SAUR_IGNORE_PATHS SAUR_ALL_BRANCHES SAUR_IGNORE_BRANCHES
-  SAUR_BUILD_TIMEOUT SAUR_NOCHECK SAUR_COLOR SAUR_EX_COLOR
+  SAUR_BUILD_TIMEOUT SAUR_NOCHECK SAUR_SIGN SAUR_KEY SAUR_KEYFILE
+  SAUR_COLOR SAUR_EX_COLOR SAUR_SILVER SAUR_AQUA SAUR_HOMEPAGE
   SAUR_IMAGE SAUR_ENGINE SAUR_PACKAGER SAUR_WORK SAUR_OUT SAUR_STATE SAUR_PORT SAUR_JOBS)
 
 resolve_home() {
@@ -66,8 +69,10 @@ resolve_home() {
 
 load_config() {
   # Defaults < saur.conf < saur.local.conf < environment.
-  local envsnap f
-  envsnap=$(declare -px | grep -E '^declare -x SAUR_' | sed 's/^declare -x /declare -gx /' || true)
+  local envsnap='' f v
+  for v in $(compgen -e); do
+    if [[ $v == SAUR_* ]]; then envsnap+="$(declare -p "$v" | sed '1s/^declare -x /declare -gx /')"$'\n'; fi
+  done
   SAUR_NAME=saur SAUR_EX_SUFFIX=-ex
   SAUR_ORG=Szmelc-INC
   SAUR_ARCH=x86_64
@@ -78,7 +83,9 @@ load_config() {
   SAUR_IGNORE_PATHS='(^|/)(tests?|testdata|examples?|vendor|node_modules|third_party)/'
   SAUR_ALL_BRANCHES=1 SAUR_IGNORE_BRANCHES='^(dependabot|renovate)/|^gh-pages$'
   SAUR_BUILD_TIMEOUT=3600 SAUR_NOCHECK=0
-  SAUR_COLOR=#105c5c SAUR_EX_COLOR=#750f0f
+  SAUR_SIGN=auto SAUR_KEY= SAUR_KEYFILE=keys/saur.asc
+  SAUR_COLOR=#105c5c SAUR_EX_COLOR=#750f0f SAUR_SILVER=#c0c0c0 SAUR_AQUA=#7fffd4
+  SAUR_HOMEPAGE=https://szmelc.com
   SAUR_IMAGE=docker.io/library/archlinux:base-devel SAUR_ENGINE=
   SAUR_PACKAGER='SAUR <https://github.com/Szmelc-INC/SAUR>'
   SAUR_WORK=work SAUR_OUT=public SAUR_STATE=state SAUR_PORT=8080 SAUR_JOBS=8
@@ -87,6 +94,9 @@ load_config() {
     if [[ -f $f ]]; then source "$f"; fi
   done
   eval "$envsnap"
+  # A fingerprint, however it was pasted: no spaces, no 0x, upper case.
+  SAUR_KEY=${SAUR_KEY//[[:space:]]/}; SAUR_KEY=${SAUR_KEY#0x}; SAUR_KEY=${SAUR_KEY^^}
+  case ${SAUR_SIGN,,} in 1|yes|on|true|required) SAUR_SIGN=1 ;; 0|no|off|false|never) SAUR_SIGN=0 ;; *) SAUR_SIGN=auto ;; esac
   abs() { if [[ $1 == /* ]]; then printf '%s' "$1"; else printf '%s/%s' "$SAUR_HOME" "$1"; fi; }
   WORK=$(abs "$SAUR_WORK") OUT=$(abs "$SAUR_OUT") STATEDIR=$(abs "$SAUR_STATE")
   ARCH=$SAUR_ARCH REPODIR=$OUT/$ARCH
@@ -146,17 +156,17 @@ state_del() { unset 'ST_SHA[$1]' 'ST_STATUS[$1]' 'ST_PKGS[$1]' 'ST_TIME[$1]'; }
 # ---------------------------------------------------------------------------
 untar() { if have bsdtar; then bsdtar -xOf "$1" "$2"; else tar --wildcards -xOzf "$1" "$2"; fi; }
 
-# name \t version \t desc \t filename \t csize \t builddate \t url \t arch
+# name \t version \t desc \t filename \t csize \t builddate \t url \t arch \t signed (1: %PGPSIG% embedded)
 db_records() {
   [[ -f $DB ]] || return 0
   untar "$DB" '*/desc' 2>/dev/null | awk '
-    function flush() { if (d == "") d = " "; if (n != "") print n "\t" v "\t" d "\t" f "\t" c "\t" b "\t" u "\t" a; n = v = d = f = c = b = u = a = "" }
+    function flush() { if (d == "") d = " "; if (n != "") print n "\t" v "\t" d "\t" f "\t" c "\t" b "\t" u "\t" a "\t" (s ? 1 : 0); n = v = d = f = c = b = u = a = ""; s = 0 }
     /^%[A-Z0-9]+%$/ { if ($0 == "%FILENAME%") flush(); k = $0; next }
     /^$/ { k = ""; next }
     { gsub(/\t/, " ") }
     k == "%FILENAME%" { f = $0 } k == "%NAME%" { n = $0 } k == "%VERSION%" { v = $0 }
     k == "%DESC%" { d = $0 } k == "%CSIZE%" { c = $0 } k == "%BUILDDATE%" { b = $0 }
-    k == "%URL%" { u = $0 } k == "%ARCH%" { a = $0 }
+    k == "%URL%" { u = $0 } k == "%ARCH%" { a = $0 } k == "%PGPSIG%" { s = 1 }
     END { flush() }' | sort -f || true
 }
 db_version() { db_records | awk -F'\t' -v n="$1" '$1 == n { print $2; exit }'; }
@@ -191,15 +201,20 @@ db_init() {
 db_materialize() {
   local ch f
   for ch in "${CHANNELS[@]}"; do
-    for f in "$REPODIR/$(channel_repo "$ch")".{db,files}; do
+    for f in "$REPODIR/$(channel_repo "$ch")".{db,files}{,.sig}; do
       if [[ -L $f ]]; then cp --remove-destination "$(readlink -f "$f")" "$f"; fi
     done
   done
-  rm -f "$REPODIR"/*.old
+  rm -f "$REPODIR"/*.old "$REPODIR"/*.old.sig
 }
 
-# Every db and files archive, symlinks included (what the release must carry).
-db_files() { local ch; for ch in "${CHANNELS[@]}"; do printf '%s\n' "$REPODIR/$(channel_repo "$ch")".{db,files}{,.tar.gz}; done; }
+# Every db and files archive and its signature (what the release must carry).
+db_files() {
+  local ch f
+  for ch in "${CHANNELS[@]}"; do
+    for f in "$REPODIR/$(channel_repo "$ch")".{db,files}{,.tar.gz}{,.sig}; do if [[ -e $f ]]; then printf '%s\n' "$f"; fi; done
+  done
+}
 
 # Delete package files no database references (both channels share the directory).
 db_gc() {
@@ -211,6 +226,158 @@ db_gc() {
     [[ -n ${keep[$fn]:-} ]] || { rm -f "$f"; n=$((n + 1)); }
   done
   ((n == 0)) || info "removed $n stale package file(s)"
+}
+
+# ---------------------------------------------------------------------------
+# Signing: SAUR_KEY (a fingerprint) signs every package, both databases and the
+# site's lists. Its public half (SAUR_KEYFILE) goes into the add script, so clients
+# trust exactly that key. The secret half comes from the gpg keyring or from
+# $SAUR_GPG_KEY (armored, how CI passes it), which main() takes out of the environment
+# before anything else runs, so no PKGBUILD ever sees it.
+# ---------------------------------------------------------------------------
+SIGNING=0 SIGN_CHECKED=0 RING='' GPG_TMP='' SIGNING_KEY_ARMOR='' KEY_ENV=''
+sign_cleanup() {
+  if [[ -n $KEY_ENV ]]; then rm -f "$KEY_ENV"; fi
+  if [[ -n $GPG_TMP ]]; then gpgconf --homedir "$GPG_TMP" --kill all >/dev/null 2>&1 || true; rm -rf "$GPG_TMP"; fi
+  if [[ -n $RING ]]; then rm -f "$RING"; fi
+}
+key_file() { abs "$SAUR_KEYFILE"; }
+fpr_pretty() { sed -E 's/(.{4})/\1 /g; s/ $//' <<<"$1"; }
+
+# Public keyring for gpgv, from SAUR_KEYFILE (else the gpg keyring). 1 without a key.
+ring_init() {
+  [[ -n $RING ]] && return 0
+  [[ -n $SAUR_KEY ]] && have gpg && have gpgv || return 1
+  RING=$(mktemp)
+  if [[ -f $(key_file) ]]; then gpg --batch --quiet --dearmor <"$(key_file)" >"$RING" 2>/dev/null || true
+  else gpg --batch --quiet --export "$SAUR_KEY" >"$RING" 2>/dev/null || true
+  fi
+  if [[ ! -s $RING ]]; then rm -f "$RING"; RING=''; return 1; fi
+}
+
+# Is $2 a good detached signature (binary or armored) of $1, made by SAUR_KEY?
+sig_ok() {
+  [[ -f $1 && -f $2 ]] && ring_init || return 1
+  local out
+  out=$(gpgv --keyring "$RING" --status-fd 1 "$2" "$1" 2>/dev/null) || return 1
+  grep -qE "^\[GNUPG:\] VALIDSIG .* $SAUR_KEY\$" <<<"$out"
+}
+sig_state() { if [[ ! -f $2 ]]; then echo unsigned; elif sig_ok "$1" "$2"; then echo ok; else echo bad; fi; }
+
+# Decide once per process whether output gets signed. SAUR_SIGN=1 makes a missing
+# key fatal (CI on main); auto signs when the secret key is at hand.
+sign_setup() {
+  ((SIGN_CHECKED)) && return 0
+  SIGN_CHECKED=1
+  [[ $SAUR_SIGN == 0 ]] && return 0
+  if [[ -z $SAUR_KEY ]]; then
+    [[ $SAUR_SIGN == 1 ]] && die "SAUR_SIGN=1 but no SAUR_KEY is configured (saur key gen)"
+    return 0
+  fi
+  if ! have gpg || ! have gpgv; then
+    [[ $SAUR_SIGN == 1 ]] && die "signing needs gpg and gpgv (gnupg)"
+    warn "gpg missing: output stays unsigned"; return 0
+  fi
+  if [[ -n $SIGNING_KEY_ARMOR ]]; then
+    GPG_TMP=$(mktemp -d); chmod 700 "$GPG_TMP"
+    export GNUPGHOME=$GPG_TMP
+    gpg --batch --quiet --import <<<"$SIGNING_KEY_ARMOR" 2>/dev/null || die "SAUR_GPG_KEY: not an importable secret key"
+    SIGNING_KEY_ARMOR=''
+  fi
+  if gpg --batch --with-colons --list-secret-keys "$SAUR_KEY" 2>/dev/null | grep -q '^sec'; then
+    SIGNING=1
+    info "signing with $(fpr_pretty "$SAUR_KEY")"
+  elif [[ $SAUR_SIGN == 1 ]]; then
+    die "no secret key for $SAUR_KEY: set SAUR_GPG_KEY or import the key into gpg"
+  else
+    warn "no secret key for $SAUR_KEY here: output stays unsigned (release push refuses it)"
+  fi
+}
+
+gpg_sign() { # file [--armor]: detached signature next to the file, .sig (or .asc)
+  local f=$1 ext=sig
+  shift
+  [[ ${1:-} == --armor ]] && ext=asc
+  gpg --batch --yes --quiet --no-tty --local-user "$SAUR_KEY!" "$@" --output "$f.$ext" --detach-sign "$f"
+}
+
+# Sign what lacks a valid signature: packages first, re-added so the database embeds
+# the signature (%PGPSIG%) and pacman never has to fetch a .sig, then every database.
+# Idempotent: a run that changed nothing touches no file. $1=1 re-signs everything.
+sign_repo() {
+  sign_setup
+  ((SIGNING)) || return 0
+  local force=${1:-0} ch fn has base f n=0
+  local -a add
+  for ch in "${CHANNELS[@]}"; do
+    use_channel "$ch"
+    [[ -f $DB ]] || continue
+    add=()
+    while IFS=$'\t' read -r fn has; do
+      f=$REPODIR/$fn
+      if [[ ! -f $f ]]; then warn "$fn is in [$NAME] but not in $REPODIR, cannot sign it"; continue; fi
+      if ((force)) || [[ ! -f $f.sig ]]; then gpg_sign "$f"; n=$((n + 1)); add+=("$f")
+      elif [[ $has != 1 ]]; then add+=("$f")
+      fi
+    done < <(db_records | awk -F'\t' '{ print $4 "\t" $9 }')
+    if ((${#add[@]})); then
+      repo-add -q --include-sigs "$DB" "${add[@]}" >/dev/null 2>&1 || die "repo-add failed while embedding signatures into [$NAME]"
+    fi
+  done
+  use_channel stable
+  ((n == 0)) || ok "signed $n package(s)"
+  for ch in "${CHANNELS[@]}"; do
+    for base in db files; do
+      f=$REPODIR/$(channel_repo "$ch").$base.tar.gz
+      [[ -f $f ]] || continue
+      if ((force)) || ! sig_ok "$f" "$f.sig"; then gpg_sign "$f"; info "signed ${f##*/}"; fi
+      cp --remove-destination "$f.sig" "${f%.tar.gz}.sig"
+    done
+  done
+}
+
+# Armored signatures for what people pipe into a root shell or parse: add, add-ex,
+# packages.json, packages.txt. Without a key configured, stale ones are removed.
+SITE_SIGNED=(add add-ex packages.json packages.txt)
+sign_site() {
+  local force=${1:-0} f
+  if [[ -z $SAUR_KEY || $SAUR_SIGN == 0 ]]; then
+    for f in "${SITE_SIGNED[@]}"; do rm -f "$OUT/$f.asc"; done
+    rm -f "$OUT/key.asc"; return 0
+  fi
+  if [[ -f $(key_file) ]]; then cp "$(key_file)" "$OUT/key.asc"; fi
+  sign_setup
+  ((SIGNING)) || return 0
+  for f in "${SITE_SIGNED[@]}"; do
+    f=$OUT/$f
+    [[ -f $f ]] || continue
+    if ((force)) || ! sig_ok "$f" "$f.asc"; then gpg_sign "$f" --armor; fi
+  done
+}
+
+# kind \t file \t status (ok | unsigned | bad | missing | not embedded), every signed file.
+verify_rows() {
+  local ch base f fn has s
+  for ch in "${CHANNELS[@]}"; do
+    use_channel "$ch"
+    for base in db files; do
+      f=$REPODIR/$NAME.$base.tar.gz
+      [[ -f $f ]] || continue
+      printf 'database\t%s\t%s\n' "${f##*/}" "$(sig_state "$f" "$f.sig")"
+      printf 'database\t%s\t%s\n' "$NAME.$base" "$(sig_state "${f%.tar.gz}" "${f%.tar.gz}.sig")"
+    done
+    while IFS=$'\t' read -r fn has; do
+      f=$REPODIR/$fn
+      if [[ ! -f $f ]]; then printf 'package\t%s\tmissing\n' "$fn"; continue; fi
+      s=$(sig_state "$f" "$f.sig")
+      [[ $s == ok && $has != 1 ]] && s='not embedded'
+      printf 'package\t%s\t%s\n' "$fn" "$s"
+    done < <(db_records | awk -F'\t' '{ print $4 "\t" $9 }')
+  done
+  use_channel stable
+  for f in "${SITE_SIGNED[@]}"; do
+    if [[ -f $OUT/$f ]]; then printf 'site\t%s\t%s\n' "$f" "$(sig_state "$OUT/$f" "$OUT/$f.asc")"; fi
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -337,7 +504,10 @@ resolve_shas() {
 # Building
 # ---------------------------------------------------------------------------
 as_builder() {
-  if ((EUID == 0)); then runuser -u "$BUILDER" -- env HOME="/home/$BUILDER" "$@"; else "$@"; fi
+  if ((EUID == 0)); then
+    runuser -u "$BUILDER" -- env -u GH_TOKEN -u GITHUB_TOKEN -u SAUR_GPG_KEY -u SAUR_GPG_KEY_B64 -u GNUPGHOME \
+      HOME="/home/$BUILDER" "$@"
+  else "$@"; fi
 }
 
 native_prepare() {
@@ -346,12 +516,13 @@ native_prepare() {
   mkdir -p /etc/makepkg.conf.d
   # Arch enables split debug packages by default; SAUR does not ship them.
   printf 'OPTIONS+=(!debug)\nMAKEFLAGS="-j%s"\n' "$(nproc)" >/etc/makepkg.conf.d/saur.conf
-  # Let packages depend on each other: expose the repos being built to pacman.
+  # Let packages depend on each other: expose the repos being built to pacman. Local files
+  # this run wrote itself, so no signature check (this pacman keyring lacks the SAUR key).
   local ch repo
   for ch in "${CHANNELS[@]}"; do
     repo=$(channel_repo "$ch")
     if ! grep -q "^\[$repo\]" /etc/pacman.conf; then
-      printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = file://%s\n' "$repo" "$REPODIR" >>/etc/pacman.conf
+      printf '\n[%s]\nSigLevel = Never\nServer = file://%s\n' "$repo" "$REPODIR" >>/etc/pacman.conf
     fi
   done
   pacman -Sy >/dev/null 2>&1 || true
@@ -630,12 +801,18 @@ build_one() {
       drop_name "$o" "$n"
     fi
     mv -f "$f" "$REPODIR/"
+    rm -f "$REPODIR/${f##*/}.sig"
     files+=("$REPODIR/${f##*/}")
     BUILT_NAMES+=("$n")
   done
   ((produced)) || { err "$label: makepkg produced no packages"; use_channel stable; return 1; }
   ((${#files[@]})) || { use_channel stable; return 2; }
-  if ! repo-add -q -R "$DB" "${files[@]}" >>"$log" 2>&1; then
+  # Signed before repo-add, so the database embeds the signature. No -R: when the new file
+  # has the old name it would delete the package it just added; db_gc drops old files.
+  if ((SIGNING)); then
+    for f in "${files[@]}"; do gpg_sign "$f" || { err "$label: signing ${f##*/} failed"; use_channel stable; return 1; }; done
+  fi
+  if ! repo-add -q --include-sigs "$DB" "${files[@]}" >>"$log" 2>&1; then
     err "$label: repo-add failed"; use_channel stable; return 1
   fi
   if ((EUID == 0)); then pacman -Sy >/dev/null 2>&1 || true; fi
@@ -676,8 +853,20 @@ in_container() {
   local -a envs=() vars=("${CONFIG_VARS[@]}" NO_COLOR SAUR_NO_COLOR)
   local v
   for v in "${vars[@]}"; do [[ -n ${!v:-} ]] && envs+=(-e "$v=${!v}"); done
-  # Tokens by name only, so they never show up in the process list.
+  # Tokens and the signing key by name only, so they never show up in the process list.
   for v in GH_TOKEN GITHUB_TOKEN; do [[ -n ${!v:-} ]] && envs+=(-e "$v"); done
+  local key=$SIGNING_KEY_ARMOR
+  if [[ -z $key && -n $SAUR_KEY && $SAUR_SIGN != 0 ]] && have gpg &&
+    gpg --batch --with-colons --list-secret-keys "$SAUR_KEY" 2>/dev/null | grep -q '^sec'; then
+    key=$(gpg --batch --armor --export-secret-keys "$SAUR_KEY")
+  fi
+  # The key travels in a private env file (base64, one line): never in argv, and it also
+  # survives "pkexec docker", which wipes the environment. Removed right after the run.
+  if [[ -n $key ]]; then
+    KEY_ENV=$(mktemp); chmod 600 "$KEY_ENV"
+    printf 'SAUR_GPG_KEY_B64=%s\n' "$(base64 -w0 <<<"$key")" >"$KEY_ENV"
+    envs+=(--env-file "$KEY_ENV")
+  fi
   for v in "$WORK" "$OUT" "$STATEDIR"; do
     [[ $v == "$SAUR_HOME"/* ]] || die "$v must live inside SAUR_HOME ($SAUR_HOME) for container builds"
   done
@@ -685,6 +874,7 @@ in_container() {
   local -a tty=()
   [[ -t 1 ]] && tty=(-t)
   info "running in ${engine[*]} ($SAUR_IMAGE)"
+  local rc=0
   "${engine[@]}" run --rm "${tty[@]}" "${envs[@]}" \
     -e SAUR_HOME=/saur -e "HOST_ID=$(id -u):$(id -g)" -e "SAUR_ENGINE_NAME=${engine[-1]}" \
     -v "$SAUR_HOME:/saur" -v "$SELF:/usr/local/bin/saur:ro" \
@@ -692,7 +882,9 @@ in_container() {
     bash -c 'pacman -Syu --noconfirm --needed git jq curl >/dev/null || exit 1
       rc=0; saur "$@" --native || rc=$?
       if [[ $SAUR_ENGINE_NAME == docker ]]; then chown -R "$HOST_ID" /saur/work /saur/public /saur/state 2>/dev/null; fi
-      exit $rc' _ "$@"
+      exit $rc' _ "$@" || rc=$?
+  if [[ -n $KEY_ENV ]]; then rm -f "$KEY_ENV"; KEY_ENV=''; fi
+  return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -813,9 +1005,10 @@ cmd_build() {
   local t
   for t in git jq curl makepkg repo-add vercmp; do have "$t" || die "missing tool: $t"; done
   mkdir -p "$WORK/src" "$LOGS"
+  ((DRY)) || sign_setup
   db_init; native_prepare; state_load; load_dbver
   if ((EUID == 0)); then chown "$BUILDER:" "$LOGS"; fi
-  local before; before=$(cat "$REPODIR"/*.db.tar.gz "$STATE" 2>/dev/null | sha256sum || true)
+  local before; before=$(cat "$REPODIR"/*.db.tar.gz{,.sig} "$STATE" 2>/dev/null | sha256sum || true)
 
   step "Scanning sources"
   local rows; rows=$(list_sources | resolve_shas)
@@ -921,10 +1114,11 @@ cmd_build() {
     state_save
     rm -rf "$dir"
   done
+  sign_repo
   db_gc
   state_save
 
-  local after; after=$(cat "$REPODIR"/*.db.tar.gz "$STATE" 2>/dev/null | sha256sum || true)
+  local after; after=$(cat "$REPODIR"/*.db.tar.gz{,.sig} "$STATE" 2>/dev/null | sha256sum || true)
   local changed=false
   [[ $before != "$after" ]] && changed=true
   echo "$changed" >"$WORK/changed"
@@ -964,12 +1158,17 @@ server_lines() {
 
 html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 
-# One-time setup script: curl -fsSL $SAUR_URL/add | sudo bash  (add-ex: experimental too)
+# One-time setup script: curl -fsSL $SAUR_URL/add | sudo bash  (add-ex: experimental too).
+# With a signing key it also trusts that key (and only it) and requires signatures; run
+# again, it brings an older unsigned setup up to date without the welcome message.
 write_add_script() { # file, experimental by default (0|1)
+  local fpr='' key=''
+  if [[ -n $SAUR_KEY && $SAUR_SIGN != 0 && -f $(key_file) ]]; then fpr=$SAUR_KEY key=$(<"$(key_file)"); fi
   {
     cat <<'EOF'
 #!/usr/bin/env bash
-# Szmelc AUR (SAUR) one-time setup: adds the repository to /etc/pacman.conf, syncs, says hi once.
+# Szmelc AUR (SAUR) setup: adds the repository to /etc/pacman.conf, trusts its signing
+# key, syncs, says hi once. Running it again only updates what changed.
 # Flags: --ex also adds the experimental channel, --stable only the stable one.
 set -euo pipefail
 conf=${PACMAN_CONF:-/etc/pacman.conf}
@@ -979,34 +1178,71 @@ EOF
     printf 'servers=%q\n' "$(server_lines)"
     printf 'url=%q\n' "$SAUR_URL"
     printf 'ex=%d\n' "$2"
+    printf '# Every package and database is signed by this key. Empty: an unsigned repository.\n'
+    printf 'fpr=%q\n' "$fpr"
+    printf 'key=%q\n' "$key"
     cat <<'EOF'
 for a in "$@"; do case $a in -x|--ex|--experimental) ex=1 ;; -s|--stable) ex=0 ;; esac; done
 if [[ $EUID -ne 0 ]]; then
   echo "Szmelc AUR: needs root to edit $conf. Run: curl -fsSL $url/add | sudo bash" >&2
   exit 1
 fi
-want=("$name")
-((ex)) && want+=("$exname")
-added=()
-for r in "${want[@]}"; do
-  if grep -q "^\[$r\]" "$conf"; then echo "Szmelc AUR: [$r] is already in $conf."; continue; fi
-  ((${#added[@]})) || cp "$conf" "$conf.saur.bak"
-  label=stable
-  [[ $r == "$exname" ]] && label='experimental: side branches and work in progress, packages end in -ex'
-  printf '\n# Szmelc AUR (%s): %s\n[%s]\nSigLevel = Optional TrustAll\n%s\n' "$label" "$url" "$r" "$servers" >>"$conf"
-  added+=("$r")
-done
-if ((${#added[@]} == 0)); then echo "Nothing to do. (Update with: pacman -Syu)"; exit 0; fi
-pacman -Syy
-count=$(pacman -Slq "$name" 2>/dev/null | wc -l)
 c=$'\e[1;38;2;31;138;138m' b=$'\e[1m' d=$'\e[2m' r=$'\e[0m'
 [[ -t 1 && -z ${NO_COLOR:-} ]] || c='' b='' d='' r=''
+siglevel='Optional TrustAll'
+if [[ -n $fpr ]]; then
+  siglevel=Required
+  # Trust exactly this key, for pacman only. A keyring without a local master key
+  # (fresh containers) gets one first, lsign needs it.
+  pacman-key --list-secret-keys 2>/dev/null | grep -q '^sec' || pacman-key --init >/dev/null 2>&1
+  kf=$(mktemp)
+  printf '%s\n' "$key" >"$kf"
+  pacman-key --add "$kf" >/dev/null 2>&1 || { rm -f "$kf"; echo "Szmelc AUR: pacman-key --add failed" >&2; exit 1; }
+  rm -f "$kf"
+  pacman-key --finger "$fpr" >/dev/null 2>&1 || { echo "Szmelc AUR: key $fpr did not import" >&2; exit 1; }
+  pacman-key --lsign-key "$fpr" >/dev/null 2>&1 || { echo "Szmelc AUR: could not trust key $fpr (pacman-key --lsign-key)" >&2; exit 1; }
+fi
+want=("$name")
+((ex)) && want+=("$exname")
+added=() updated=()
+backup() { [[ -f $conf.saur.bak && ${#added[@]}${#updated[@]} != 00 ]] || cp "$conf" "$conf.saur.bak"; }
+for r in "${want[@]}"; do
+  if grep -q "^\[$r\]" "$conf"; then
+    # Already there: make its SigLevel what the repository needs now.
+    new=$(awk -v sec="[$r]" -v lvl="SigLevel = $siglevel" '
+      $0 == sec { print; print lvl; in_sec = 1; next }
+      /^\[/ { in_sec = 0 }
+      in_sec && /^[[:space:]]*SigLevel[[:space:]]*=/ { next }
+      { print }' "$conf")
+    if [[ $new != "$(<"$conf")" ]]; then backup; printf '%s\n' "$new" >"$conf"; updated+=("$r"); fi
+    continue
+  fi
+  backup
+  label=stable
+  [[ $r == "$exname" ]] && label='experimental: side branches and work in progress, packages end in -ex'
+  printf '\n# Szmelc AUR (%s): %s\n[%s]\nSigLevel = %s\n%s\n' "$label" "$url" "$r" "$siglevel" "$servers" >>"$conf"
+  added+=("$r")
+done
+pretty=$(sed -E 's/(.{4})/\1 /g; s/ $//' <<<"$fpr")
+if ((${#added[@]} == 0)); then
+  if ((${#updated[@]})); then
+    pacman -Syy >/dev/null
+    echo "Szmelc AUR: $(printf '[%s] ' "${updated[@]}")now SigLevel = $siglevel${fpr:+, signed by $pretty}."
+  else
+    echo "Szmelc AUR: already set up${fpr:+, signed by $pretty}. (Update with: pacman -Syu)"
+  fi
+  exit 0
+fi
+pacman -Syy
+count=$(pacman -Slq "$name" 2>/dev/null | wc -l)
 if grep -q "^\[$exname\]" "$conf"; then
   excount=$(pacman -Slq "$exname" 2>/dev/null | wc -l)
   exline="  ${b}Experimental:${r} [$exname] is on: ${excount} packages named *-ex, safe next to the stable ones."
 else
   exline="  ${b}Experimental:${r} curl -fsSL $url/add-ex | sudo bash  ${d}(adds [$exname], packages named *-ex)${r}"
 fi
+sigline=''
+[[ -n $fpr ]] && sigline="  ${b}Signed:${r}   every package and database, key ${pretty}"
 cat <<MSG
 
 ${c}  ▄▀▀ ▄▀▄ █ █ █▀▄   Szmelc AUR is in: ${count} Szmelc packages, rebuilt when their code changes.${r}
@@ -1017,7 +1253,8 @@ ${c}  ▄██ █▀█ ▀▄█ █▀▄${r}   ${d}This message shows once.
   ${b}Pick one:${r} pacman -Slq $name | fzf --preview 'pacman -Si $name/{}' | xargs -ro sudo pacman -S
   ${b}Install:${r}  sudo pacman -S $name/<package>
 $exline
-  ${b}Web:${r}      $url
+${sigline:+$sigline
+}  ${b}Web:${r}      $url
 
 MSG
 EOF
@@ -1033,7 +1270,7 @@ site_color() { # var default
 
 cmd_site() {
   if [[ ${1:-} == -h || ${1:-} == --help ]]; then help_cmd site; exit 0; fi
-  db_init; db_materialize
+  db_init; sign_repo; db_materialize
   step "Generating site in $OUT"
   local recs; recs=$(db_records_all)
   # branch/commit come from the "[experimental: branch@sha]" tag build_dir appends to the description.
@@ -1042,18 +1279,41 @@ cmd_site() {
       | {name: .[1], version: .[2], description: (.[3] | sub("^ $"; "")), channel: .[0], filename: .[4],
          size: (.[5] | tonumber? // 0), builddate: (.[6] | tonumber? // 0), url: .[7], arch: .[8],
          branch: ($src.b // null), commit: ($src.c // null),
-         download: ($arch + "/" + .[4])})' \
+         download: ($arch + "/" + .[4]), signed: (.[9] == "1"),
+         signature: (if .[9] == "1" then $arch + "/" + .[4] + ".sig" else null end)})' \
     <<<"$recs" >"$OUT/packages.json"
   local exrepo strepo
   strepo=$(channel_repo stable) exrepo=$(channel_repo experimental)
   awk -F'\t' -v s="$strepo" -v x="$exrepo" '{ print ($1 == "stable" ? s : x) "/" $2 " " $3 }' <<<"$recs" | grep . >"$OUT/packages.txt" || true
+  # Atom feed of the 50 newest builds; an entry id is the package file, so one per version.
+  jq -r --arg url "$SAUR_URL" --arg st "$strepo" --arg ex "$exrepo" '
+    def x: tostring | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;") | gsub("\""; "&quot;");
+    (sort_by(-.builddate) | .[:50]) as $e
+    | "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+      "<feed xmlns=\"http://www.w3.org/2005/Atom\">",
+      "<title>Szmelc AUR</title>",
+      "<subtitle>New and updated packages in Szmelc AUR</subtitle>",
+      "<link rel=\"alternate\" href=\"\($url | x)/\"/>",
+      "<link rel=\"self\" href=\"\($url | x)/feed.xml\"/>",
+      "<id>\($url | x)/feed.xml</id>",
+      "<updated>\(($e[0].builddate // 0) | todate)</updated>",
+      "<author><name>Szmelc.INC</name></author>",
+      ($e[] | "<entry><title>\((if .channel == "stable" then $st else $ex end) | x)/\(.name | x) \(.version | x)</title>"
+        + "<id>\($url | x)/\(.download | x)</id>"
+        + "<link href=\"\((if .url != "" then .url else $url + "/#" + .channel end) | x)\"/>"
+        + "<link rel=\"enclosure\" href=\"\($url | x)/\(.download | x)\" length=\"\(.size)\"/>"
+        + "<updated>\(.builddate | todate)</updated>"
+        + "<summary>\(.description | x)</summary></entry>"),
+      "</feed>"' "$OUT/packages.json" >"$OUT/feed.xml"
 
   write_add_script "$OUT/add" 0
   write_add_script "$OUT/add-ex" 1
+  sign_site
 
-  local color excolor
+  local color excolor silver aqua
   color=$(site_color SAUR_COLOR '#105c5c') excolor=$(site_color SAUR_EX_COLOR '#750f0f')
-  local rows='' ch n v desc fn csz bd u repo src built
+  silver=$(site_color SAUR_SILVER '#c0c0c0') aqua=$(site_color SAUR_AQUA '#7fffd4')
+  local rows='' ch n v desc fn csz bd u repo src built sig
   if [[ -n $recs ]]; then
     rows=$(while IFS=$'\t' read -r ch n v desc fn csz bd u _; do
       desc=${desc# } src=
@@ -1062,22 +1322,60 @@ cmd_site() {
       fi
       if [[ $ch == stable ]]; then repo=$strepo; else repo=$exrepo; fi
       built=$(date -u -d "@${bd:-0}" +%F 2>/dev/null || echo -)
+      sig=
+      [[ -f $REPODIR/$fn.sig ]] && sig=$(printf '<a href="%s/%s.sig" title="detached signature">sig</a>' "$ARCH" "$(html_escape <<<"$fn")")
       n=$(html_escape <<<"$n")
-      printf '<tr data-ch="%s"><td class="pkg"><a href="%s">%s</a>%s</td><td class="ver"><code>%s</code></td>' \
-        "$ch" "$(html_escape <<<"$u")" "$n" \
+      printf '<tr data-ch="%s" data-name="%s" data-built="%s" data-size="%s"><td class="pkg"><a href="%s">%s</a>%s</td><td class="ver"><code>%s</code></td>' \
+        "$ch" "$n" "${bd:-0}" "${csz:-0}" "$(html_escape <<<"$u")" "$n" \
         "$( [[ -n $src ]] && printf '<span class="src" title="experimental build of this branch@commit">%s</span>' "$(html_escape <<<"$src")")" \
         "$(html_escape <<<"$v")"
       printf '<td class="repo"><span class="ch %s">%s</span></td><td class="desc">%s</td><td class="r">%s</td><td class="r">%s</td>' \
         "$ch" "$repo" "$(html_escape <<<"$desc")" "$built" "$(numfmt --to=iec "${csz:-0}" 2>/dev/null || echo "$csz")"
-      printf '<td class="act"><button class="cp" data-cp="sudo pacman -S %s/%s" title="copy: sudo pacman -S %s/%s">install</button><a href="%s/%s" title="download the package file">pkg</a></td></tr>\n' \
-        "$repo" "$n" "$repo" "$n" "$ARCH" "$(html_escape <<<"$fn")"
+      printf '<td class="act"><button class="cp" data-cp="sudo pacman -S %s/%s" title="copy: sudo pacman -S %s/%s">install</button><a href="%s/%s" title="download the package file">pkg</a>%s</td></tr>\n' \
+        "$repo" "$n" "$repo" "$n" "$ARCH" "$(html_escape <<<"$fn")" "$sig"
     done <<<"$recs")
   fi
-  local count st_n ex_n
+  local count st_n ex_n signed_n total last
   count=$(grep -c . <<<"$recs" || true)
   st_n=$(grep -c '^stable' <<<"$recs" || true)
   ex_n=$(grep -c '^experimental' <<<"$recs" || true)
+  signed_n=$(awk -F'\t' '$10 == 1' <<<"$recs" | grep -c . || true)
+  total=$(awk -F'\t' '{ s += $6 } END { print s + 0 }' <<<"$recs" | numfmt --to=iec 2>/dev/null || echo 0)
+  last=$(awk -F'\t' '$7 > m { m = $7 } END { print m + 0 }' <<<"$recs")
+  if ((last)); then last=$(date -u -d "@$last" '+%Y-%m-%d'); else last=-; fi
   local updated; updated=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+  # Signing: a badge, and the by-hand setup with the key and its fingerprint.
+  local signed='' pretty='' siglevel='Optional TrustAll' keysteps=''
+  if [[ -n $SAUR_KEY && $SAUR_SIGN != 0 && -f $OUT/key.asc ]]; then
+    pretty=$(fpr_pretty "$SAUR_KEY") siglevel=Required
+    if ((signed_n == count)); then
+      signed="<a class=\"signed\" href=\"key.asc\" title=\"every package and database is signed by $pretty\">✓ signed</a>"
+    fi
+    keysteps="# 1. Trust the signing key (fingerprint: $pretty)
+curl -fsSLO ${SAUR_URL}/key.asc
+sudo pacman-key --add key.asc
+sudo pacman-key --lsign-key ${SAUR_KEY}
+
+# 2. Add to /etc/pacman.conf, then: sudo pacman -Syy
+"
+  fi
+  local manual
+  manual=$(html_escape <<<"$keysteps[$strepo]
+SigLevel = $siglevel
+$(server_lines)
+
+# experimental channel (optional)
+[$exrepo]
+SigLevel = $siglevel
+$(server_lines)")
+  local verify=''
+  if [[ -n $pretty ]]; then
+    verify=$(html_escape <<<"curl -fsSL -O ${SAUR_URL}/key.asc -O ${SAUR_URL}/add -O ${SAUR_URL}/add.asc
+gpg --import key.asc && gpg --verify add.asc add && sudo bash add")
+  fi
+  local gh=https://github.com/$SAUR_GH_REPO home=${SAUR_HOMEPAGE%/}
+  local homelabel=${home#*://}
   # Unquoted heredoc: keep backticks and dollar-brace out of the CSS and JS below.
   cat >"$OUT/index.html" <<EOF
 <!doctype html>
@@ -1086,30 +1384,59 @@ cmd_site() {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Szmelc AUR</title>
-<meta name="description" content="Szmelc AUR (SAUR): pacman repository of Szmelc.INC software, rebuilt automatically from git.">
-<meta name="theme-color" content="${color}">
+<meta name="description" content="Szmelc AUR (SAUR): signed pacman repository of Szmelc.INC software, rebuilt automatically from git.">
+<meta name="theme-color" content="#0b0b0b">
+<meta name="color-scheme" content="dark light">
+<link rel="alternate" type="application/atom+xml" title="Szmelc AUR: new packages" href="feed.xml">
+<script>try { if (localStorage.getItem('saur-theme') === 'light') document.documentElement.dataset.theme = 'light'; } catch (e) {}</script>
 <style>
-:root { --brand:${color}; --brand-ex:${excolor}; --bg:#f7f9f9; --fg:#161c1c; --mute:#5e6868; --line:#dfe6e6; --code:#edf2f2; --tint:0%; }
-@media (prefers-color-scheme: dark) { :root { --bg:#0e1213; --fg:#e6eded; --mute:#93a0a0; --line:#243030; --code:#161d1e; --tint:55%; } }
+:root { --brand:${color}; --brand-ex:${excolor}; --silver-base:${silver}; --aqua:${aqua};
+  --bg:#0b0b0b; --surface:#131313; --raise:#1b1b1b; --fg:#e8e8e8; --mute:#8e8e8e; --line:#262626;
+  --silver:var(--silver-base); --tint:55%; color-scheme:dark; }
+:root[data-theme="light"] { --bg:#f3f3f3; --surface:#ffffff; --raise:#e9e9e9; --fg:#141414; --mute:#5b5b5b; --line:#d6d6d6;
+  --silver:color-mix(in srgb, var(--silver-base), black 50%); --tint:0%; color-scheme:light; }
 body { --acc:var(--brand); }
 body[data-tab="experimental"] { --acc:var(--brand-ex); }
-body { --acc-t:color-mix(in srgb, var(--acc), white var(--tint)); --st-t:color-mix(in srgb, var(--brand), white var(--tint)); --ex-t:color-mix(in srgb, var(--brand-ex), white var(--tint)); }
+body { --acc-t:color-mix(in srgb, var(--acc), white var(--tint)); --ex-t:color-mix(in srgb, var(--brand-ex), white var(--tint)); }
 * { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 ui-sans-serif,system-ui,sans-serif; border-top:5px solid var(--acc); transition:border-color .2s; }
-main { max-width:1040px; margin:0 auto; padding:36px 16px 64px; }
-h1 { font-size:30px; margin:0 0 6px; letter-spacing:-.01em; } h1 span { color:var(--acc-t); transition:color .2s; }
-h1 small { font-size:15px; color:var(--mute); font-weight:500; }
+html { background:var(--bg); }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 ui-sans-serif,system-ui,sans-serif; border-top:4px solid var(--acc); transition:border-color .2s; }
+main { max-width:1080px; margin:0 auto; padding:20px 16px 64px; }
+a { color:var(--acc-t); text-decoration:none; } a:hover { text-decoration:underline; }
+button, select, input { font:inherit; color:inherit; }
+button { cursor:pointer; }
+:focus-visible { outline:2px solid var(--acc-t); outline-offset:2px; }
+.top { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; margin-bottom:28px; }
+.logo { margin:0; font:11px/1.05 ui-monospace,monospace; color:var(--silver); white-space:pre; text-decoration:none; }
+.logo:hover { text-decoration:none; color:var(--fg); }
+nav { display:flex; flex-wrap:wrap; gap:6px; }
+.pill { display:inline-flex; align-items:center; gap:6px; padding:5px 12px; border:1px solid var(--line); border-radius:999px; background:var(--surface); color:var(--silver); font-size:13px; font-weight:500; white-space:nowrap; text-decoration:none; transition:background .15s, border-color .15s, color .15s; }
+.pill:hover { text-decoration:none; border-color:var(--brand); color:var(--fg); }
+.pill.main { background:var(--brand); border-color:var(--brand); color:#fff; }
+.pill.main:hover { background:color-mix(in srgb, var(--brand), white 12%); }
+.pill svg { width:14px; height:14px; fill:currentColor; flex:none; }
+h1 { font-size:34px; line-height:1.15; margin:0 0 8px; letter-spacing:-.02em; } h1 span { color:var(--acc-t); transition:color .2s; }
+h1 small { font-size:15px; color:var(--silver); font-weight:500; letter-spacing:.08em; margin-left:4px; }
 p { color:var(--mute); margin:0 0 12px; } p b { color:var(--fg); }
+.stats { display:flex; flex-wrap:wrap; gap:8px 20px; align-items:center; margin:14px 0 4px; font-size:13px; color:var(--mute); }
+.stats b { color:var(--silver); font-weight:600; font-variant-numeric:tabular-nums; }
+.signed { padding:2px 10px; border-radius:999px; background:var(--aqua); color:#0b0b0b; font-weight:700; font-size:12px; letter-spacing:.02em; }
+.signed:hover { text-decoration:none; filter:brightness(1.08); }
 .cmd { position:relative; margin:0 0 16px; }
-pre { background:var(--code); border:1px solid var(--line); border-left:3px solid var(--acc); border-radius:8px; padding:12px 72px 12px 14px; overflow-x:auto; margin:0; }
+pre { background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--acc); border-radius:8px; padding:12px 72px 12px 14px; overflow-x:auto; margin:0; }
 code, pre { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
 .cmd .cp { position:absolute; top:8px; right:8px; }
-button { font:inherit; color:inherit; cursor:pointer; }
-.cp { padding:2px 8px; font-size:12px; border:1px solid var(--line); border-radius:6px; background:var(--bg); }
-.cp:hover { border-color:var(--acc); color:var(--acc-t); }
+.cp { padding:2px 8px; font-size:12px; border:1px solid var(--line); border-radius:6px; background:var(--raise); color:var(--silver); }
+.cp:hover { border-color:var(--acc); color:var(--fg); }
 .cp.done { background:var(--acc); border-color:var(--acc); color:#fff; }
+details.manual { margin:0 0 16px; border:1px solid var(--line); border-radius:8px; background:var(--surface); }
+details.manual summary { cursor:pointer; padding:10px 14px; color:var(--silver); font-size:14px; font-weight:500; }
+details.manual[open] summary { border-bottom:1px solid var(--line); }
+details.manual .in { padding:14px; }
+details.manual pre { background:var(--bg); }
+.fpr { font:13px ui-monospace,monospace; color:var(--fg); background:var(--raise); padding:1px 6px; border-radius:4px; word-break:break-word; }
 .tabs { display:flex; gap:6px; overflow-x:auto; margin:28px 0 0; border-bottom:2px solid var(--acc); transition:border-color .2s; }
-.tab { flex:none; padding:9px 16px; border:1px solid var(--line); border-bottom:0; border-radius:8px 8px 0 0; background:transparent; font-weight:600; }
+.tab { flex:none; padding:9px 16px; border:1px solid var(--line); border-bottom:0; border-radius:8px 8px 0 0; background:var(--surface); color:var(--silver); font-weight:600; }
 .tab small { font-weight:500; color:var(--mute); margin-left:4px; }
 .tab[aria-selected="true"] { background:var(--acc); border-color:var(--acc); color:#fff; }
 .tab[aria-selected="true"] small { color:#ffffffc0; }
@@ -1117,25 +1444,28 @@ button { font:inherit; color:inherit; cursor:pointer; }
 .s, .x { display:none; }
 body[data-tab="stable"] .s, body[data-tab="experimental"] .x, body[data-tab="all"] .s, body[data-tab="all"] .x { display:block; }
 .bar { display:flex; gap:8px; margin:4px 0 12px; }
-.bar input { flex:1; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; font:inherit; }
-.bar input:focus { outline:2px solid var(--acc); outline-offset:-1px; }
+.bar input, .bar select { padding:9px 12px; border:1px solid var(--line); border-radius:8px; background:var(--surface); }
+.bar input { flex:1; min-width:0; }
+.bar input:focus, .bar select:focus { outline:2px solid var(--acc); outline-offset:-1px; }
 .wrap { overflow-x:auto; }
 table { width:100%; border-collapse:collapse; }
 th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
-th { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mute); font-weight:600; }
-tbody tr:hover { background:color-mix(in srgb, var(--acc) 7%, transparent); }
+th { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--silver); font-weight:600; }
+tbody tr:hover { background:var(--surface); }
 td.r, th.r { text-align:right; white-space:nowrap; color:var(--mute); }
-td.pkg a { font-weight:600; white-space:nowrap; } td.ver code { white-space:nowrap; }
+td.pkg a { font-weight:600; white-space:nowrap; } td.ver code { white-space:nowrap; color:var(--silver); }
 .repo { display:none; } body[data-tab="all"] .repo { display:table-cell; }
 .ch { font:12px ui-monospace,monospace; white-space:nowrap; padding:1px 7px; border-radius:99px; color:#fff; }
 .ch.stable { background:var(--brand); } .ch.experimental { background:var(--brand-ex); }
-.src { display:block; width:max-content; margin-top:3px; font:12px ui-monospace,monospace; color:var(--ex-t); border:1px solid color-mix(in srgb, var(--brand-ex) 45%, transparent); border-radius:6px; padding:0 6px; }
-.act { white-space:nowrap; } .act a { margin-left:8px; font-size:13px; }
+.src { display:block; width:max-content; margin-top:3px; font:12px ui-monospace,monospace; color:var(--ex-t); border:1px solid color-mix(in srgb, var(--brand-ex) 55%, transparent); border-radius:6px; padding:0 6px; }
+.act { white-space:nowrap; } .act a { margin-left:8px; font-size:13px; color:var(--silver); } .act a:hover { color:var(--fg); }
 .empty { display:none; padding:28px 10px; text-align:center; }
-a { color:var(--acc-t); text-decoration:none; } a:hover { text-decoration:underline; }
-footer { margin-top:28px; color:var(--mute); font-size:13px; }
+footer { margin-top:36px; padding-top:16px; border-top:1px solid var(--line); color:var(--mute); font-size:13px; display:flex; flex-wrap:wrap; gap:6px 14px; }
+footer a { color:var(--silver); } footer a:hover { color:var(--fg); }
+kbd { font:11px ui-monospace,monospace; padding:0 5px; border:1px solid var(--line); border-bottom-width:2px; border-radius:4px; color:var(--silver); }
 @media (max-width:640px) {
-  main { padding-top:24px; } h1 { font-size:26px; }
+  main { padding-top:16px; } h1 { font-size:27px; }
+  .logo { display:none; }
   .tab { padding:8px 11px; } .tab .rn { display:none; }
   pre { white-space:pre-wrap; word-break:break-all; }
   thead { display:none; }
@@ -1145,13 +1475,28 @@ footer { margin-top:28px; color:var(--mute); font-size:13px; }
   td.pkg { order:1; flex:1 1 auto; } td.act { order:2; }
   td.desc { order:3; flex-basis:100%; }
   td.ver, td.repo, td.r { order:4; font-size:12px; color:var(--mute); }
+  .hint { display:none; }
 }
 </style>
 </head>
 <body data-tab="all">
 <main>
-<h1><span>Szmelc AUR</span> <small>SAUR</small></h1>
+<header class="top">
+<a class="logo" href="./" aria-label="Szmelc AUR home">▄▀▀ ▄▀▄ █ █ █▀▄
+▄██ █▀█ ▀▄█ █▀▄</a>
+<nav aria-label="Links">
+<a class="pill main" href="$(html_escape <<<"$home")">${homelabel}</a>
+<a class="pill" href="https://github.com/$(html_escape <<<"$SAUR_ORG")"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.33c-2.23.48-2.7-1.07-2.7-1.07-.36-.92-.89-1.17-.89-1.17-.73-.5.06-.49.06-.49.8.06 1.23.83 1.23.83.72 1.22 1.87.87 2.33.67.07-.52.28-.87.5-1.07-1.78-.2-3.65-.89-3.65-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8 8 0 0 0 8 0Z"/></svg>$(html_escape <<<"$SAUR_ORG")</a>
+<a class="pill" href="${gh}">Source</a>
+<a class="pill" href="${gh}/actions/workflows/build.yml">Builds</a>
+<a class="pill" href="${gh}/issues/new">Report a problem</a>
+<a class="pill" href="feed.xml" title="Atom feed of new and updated packages"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2a12 12 0 0 1 12 12h-2A10 10 0 0 0 2 4V2Zm0 4a8 8 0 0 1 8 8H8a6 6 0 0 0-6-6V6Zm1.5 5a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3Z"/></svg>Feed</a>
+<button class="pill" id="theme" type="button" aria-pressed="false">Light</button>
+</nav>
+</header>
+<h1><span>Szmelc AUR</span><small>SAUR</small></h1>
 <p>${count} packages from Szmelc.INC, rebuilt automatically whenever their source changes.</p>
+<div class="stats"><span><b>${st_n}</b> stable</span><span><b>${ex_n}</b> experimental</span><span><b>${total}</b> in total</span><span>last build <b>${last}</b></span>${signed}</div>
 <div class="tabs" role="tablist" aria-label="Channel">
 <button class="tab" role="tab" data-f="stable" aria-selected="false">Stable<small><span class="rn">[${strepo}] </span>${st_n}</small></button>
 <button class="tab" role="tab" data-f="experimental" aria-selected="false">Experimental<small><span class="rn">[${exrepo}] </span>${ex_n}</small></button>
@@ -1166,7 +1511,12 @@ footer { margin-top:28px; color:var(--mute); font-size:13px; }
 <p><b>[${exrepo}]</b> is the experimental channel: every other branch, work in progress. Packages, commands and man pages end in <code>${SAUR_EX_SUFFIX}</code>, so they install next to the stable ones. Add both channels:</p>
 <div class="cmd"><pre>curl -fsSL ${SAUR_URL}/add-ex | sudo bash</pre><button class="cp" data-cp="curl -fsSL ${SAUR_URL}/add-ex | sudo bash">copy</button></div>
 </div>
-<div class="bar"><input id="q" type="search" placeholder="Filter packages…" aria-label="Filter packages"></div>
+<details class="manual"><summary>Set it up by hand$( [[ -n $pretty ]] && printf ' or check the signatures first')</summary><div class="in">
+$( if [[ -n $pretty ]]; then printf '<p>Every package, both databases and the add scripts are signed by one key. Fingerprint: <span class="fpr">%s</span> (also in the <a href="%s#readme">README</a>). The add script trusts this key for pacman and nothing else, then requires signatures.</p>\n' "$pretty" "$gh"; fi )
+<div class="cmd"><pre>${manual}</pre><button class="cp">copy</button></div>
+$( if [[ -n $verify ]]; then printf '<p>Read and verify the add script before it runs as root:</p>\n<div class="cmd"><pre>%s</pre><button class="cp">copy</button></div>\n' "$verify"; fi )
+</div></details>
+<div class="bar"><input id="q" type="search" placeholder="Filter packages…" aria-label="Filter packages"><select id="sort" aria-label="Sort packages"><option value="name">Name</option><option value="new">Newest</option><option value="size">Size</option></select></div>
 <div class="wrap"><table>
 <thead><tr><th>Package</th><th>Version</th><th class="repo">Repo</th><th>Description</th><th class="r">Built</th><th class="r">Size</th><th></th></tr></thead>
 <tbody id="rows">
@@ -1174,16 +1524,19 @@ ${rows}
 </tbody></table>
 <p class="empty" id="empty">Nothing here yet.</p></div>
 </div>
-<footer>Updated ${updated} · <a href="packages.json">packages.json</a> · <a href="packages.txt">packages.txt</a> · <a href="https://github.com/${SAUR_GH_REPO}">source</a></footer>
+<footer><span>Updated ${updated}</span><a href="packages.json">packages.json</a><a href="packages.txt">packages.txt</a><a href="feed.xml">feed.xml</a>$( [[ -n $pretty ]] && printf '<a href="key.asc">key.asc</a>')<a href="${gh}">source</a><a href="$(html_escape <<<"$home")">${homelabel}</a><span class="hint">Press <kbd>/</kbd> to filter</span></footer>
 </main>
 <script>
-const q = document.getElementById('q'), empty = document.getElementById('empty');
-const tabs = document.querySelectorAll('.tab');
+const root = document.documentElement, q = document.getElementById('q'), empty = document.getElementById('empty');
+const tabs = document.querySelectorAll('.tab'), body = document.getElementById('rows'), sort = document.getElementById('sort');
+const themeBtn = document.getElementById('theme');
+const save = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+const load = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
 let ch = 'stable';
 const apply = () => {
   const s = q.value.toLowerCase();
   let shown = 0;
-  for (const tr of document.querySelectorAll('#rows tr')) {
+  for (const tr of body.rows) {
     tr.hidden = !tr.textContent.toLowerCase().includes(s) || (ch !== 'all' && tr.dataset.ch !== ch);
     if (!tr.hidden) shown++;
   }
@@ -1198,24 +1551,45 @@ const select = (f) => {
   for (const t of tabs) t.setAttribute('aria-selected', String(t.dataset.f === f));
   apply();
 };
+const order = () => {
+  const k = sort.value, rows = Array.from(body.rows);
+  rows.sort((a, b) => k === 'new' ? b.dataset.built - a.dataset.built
+    : k === 'size' ? b.dataset.size - a.dataset.size : a.dataset.name.localeCompare(b.dataset.name));
+  for (const r of rows) body.appendChild(r);
+};
+const theme = (t) => {
+  if (t === 'light') root.dataset.theme = 'light'; else delete root.dataset.theme;
+  themeBtn.textContent = t === 'light' ? 'Dark' : 'Light';
+  themeBtn.setAttribute('aria-pressed', String(t === 'light'));
+};
 for (const t of tabs) t.addEventListener('click', () => { history.replaceState(null, '', '#' + t.dataset.f); select(t.dataset.f); });
 window.addEventListener('hashchange', () => select(location.hash.slice(1)));
 q.addEventListener('input', apply);
+sort.addEventListener('change', () => { order(); save('saur-sort', sort.value); });
+themeBtn.addEventListener('click', () => { const t = root.dataset.theme === 'light' ? 'dark' : 'light'; theme(t); save('saur-theme', t); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === '/' && document.activeElement !== q && !e.ctrlKey && !e.metaKey) { e.preventDefault(); q.focus(); }
+  else if (e.key === 'Escape' && document.activeElement === q) { q.value = ''; apply(); q.blur(); }
+});
 document.addEventListener('click', (e) => {
   const b = e.target.closest('.cp');
   if (!b || !navigator.clipboard) return;
-  navigator.clipboard.writeText(b.dataset.cp).then(() => {
+  const pre = b.parentNode.querySelector('pre');
+  navigator.clipboard.writeText(b.dataset.cp || (pre ? pre.textContent : '')).then(() => {
     const label = b.textContent;
     b.textContent = 'copied'; b.classList.add('done');
     setTimeout(() => { b.textContent = label; b.classList.remove('done'); }, 1200);
   });
 });
+const saved = load('saur-sort');
+if (saved && sort.querySelector('option[value="' + saved + '"]')) { sort.value = saved; order(); }
+theme(root.dataset.theme === 'light' ? 'light' : 'dark');
 select(location.hash.slice(1));
 </script>
 </body>
 </html>
 EOF
-  ok "site: $st_n stable + $ex_n experimental packages, add/add-ex scripts, index.html, packages.json"
+  ok "site: $st_n stable + $ex_n experimental packages ($signed_n signed), add/add-ex, index.html, packages.json, feed.xml"
 }
 
 cmd_list() {
@@ -1297,12 +1671,20 @@ cmd_release() {
       # GitHub stores ':' (epoch) as '.', restore the names pacman expects.
       local fn
       while IFS=$'\t' read -r _ _ _ _ fn _; do
-        if [[ $fn == *:* && ! -f $REPODIR/$fn && -f $REPODIR/${fn//:/.} ]]; then mv "$REPODIR/${fn//:/.}" "$REPODIR/$fn"; fi
+        [[ $fn == *:* ]] || continue
+        if [[ ! -f $REPODIR/$fn && -f $REPODIR/${fn//:/.} ]]; then mv "$REPODIR/${fn//:/.}" "$REPODIR/$fn"; fi
+        if [[ ! -f $REPODIR/$fn.sig && -f $REPODIR/${fn//:/.}.sig ]]; then mv "$REPODIR/${fn//:/.}.sig" "$REPODIR/$fn.sig"; fi
       done < <(db_records_all)
       ok "$(find "$REPODIR" -name '*.pkg.tar.*' | wc -l) packages restored"
       ;;
     push)
       db_init; db_materialize
+      if [[ -n $SAUR_KEY && $SAUR_SIGN != 0 ]]; then
+        local bad
+        bad=$(verify_rows | awk -F'\t' '$1 != "site" && $3 != "ok" { print $2 " (" $3 ")" }')
+        [[ -z $bad ]] || die "refusing to publish, clients would reject these (saur sign / saur verify):"$'\n'"$bad"
+        ok "every package and database is signed by $(fpr_pretty "$SAUR_KEY")"
+      fi
       gh release view "$tag" -R "$repo" >/dev/null 2>&1 ||
         gh release create "$tag" -R "$repo" --title "Szmelc AUR · $tag" --latest=false \
           --notes "Package storage for Szmelc AUR (SAUR), $tag: [$NAME] stable and [$(channel_repo experimental)] experimental. Add it: curl -fsSL $SAUR_URL/add | sudo bash"
@@ -1462,6 +1844,133 @@ cmd_extra() {
   esac
 }
 
+cmd_key() {
+  local sub=${1:-show}
+  shift || true
+  case $sub in -h|--help) help_cmd key; exit 0 ;; esac
+  have gpg || die "key needs gpg (gnupg)"
+  local kf; kf=$(key_file)
+  case $sub in
+    show)
+      JSON=0
+      while (($#)); do case $1 in --json) JSON=1 ;; -h|--help) help_cmd key; exit 0 ;; *) die "unknown flag: $1" ;; esac; shift; done
+      [[ -n $SAUR_KEY ]] || die "no signing key configured (create one: saur key gen)"
+      local uid='' created='' secret=missing cols
+      if [[ -f $kf ]]; then cols=$(gpg --batch --with-colons --show-keys "$kf" 2>/dev/null || true)
+      else cols=$(gpg --batch --with-colons --list-keys "$SAUR_KEY" 2>/dev/null || true); fi
+      uid=$(awk -F: '$1 == "uid" { print $10; exit }' <<<"$cols")
+      created=$(awk -F: '$1 == "pub" { print $6; exit }' <<<"$cols")
+      [[ -n $created ]] && created=$(date -u -d "@$created" +%F)
+      if [[ -n $SIGNING_KEY_ARMOR ]]; then secret='SAUR_GPG_KEY'
+      elif gpg --batch --with-colons --list-secret-keys "$SAUR_KEY" 2>/dev/null | grep -q '^sec'; then secret='gpg keyring'; fi
+      if ((JSON)); then
+        jq -n --arg fpr "$SAUR_KEY" --arg uid "$uid" --arg created "$created" --arg file "$kf" --argjson exists "$([[ -f $kf ]] && echo true || echo false)" \
+          --arg secret "$secret" --arg sign "$SAUR_SIGN" \
+          '{fingerprint:$fpr, uid:$uid, created:$created, keyfile:$file, keyfile_exists:$exists, secret:$secret, sign:$sign}'
+        return
+      fi
+      local sc=$GRN; [[ $secret == missing ]] && sc=$YLW
+      {
+        printf 'fingerprint\t%s%s%s\n' "$ACC" "$(fpr_pretty "$SAUR_KEY")" "$R"
+        printf 'user id\t%s\n' "${uid:--}"
+        printf 'created\t%s\n' "${created:--}"
+        printf 'public key\t%s%s\n' "$kf" "$([[ -f $kf ]] || printf ' %s(missing: saur key export > %s)%s' "$D" "$kf" "$R")"
+        printf 'secret key\t%s%s%s\n' "$sc" "$secret" "$R"
+        printf 'signing\t%s\n' "$SAUR_SIGN"
+      } | table $'KEY\tVALUE'
+      ;;
+    export)
+      if [[ -f $kf ]]; then cat "$kf"
+      elif [[ -n $SAUR_KEY ]]; then gpg --batch --armor --export "$SAUR_KEY"
+      else die "no signing key configured (saur key gen)"; fi
+      ;;
+    gen)
+      local name='Szmelc AUR' email='' force=0 upload=0
+      while (($#)); do
+        case $1 in
+          -n|--name) name=$2; shift ;;
+          -e|--email) email=$2; shift ;;
+          -f|--force) force=1 ;;
+          -u|--upload) upload=1 ;;
+          -h|--help) help_cmd key; exit 0 ;;
+          *) die "unknown flag: $1" ;;
+        esac
+        shift
+      done
+      [[ -z $SAUR_KEY || $force == 1 ]] || die "SAUR_KEY is already set ($(fpr_pretty "$SAUR_KEY")); --force makes a new one"
+      local uid="$name (package signing)${email:+ <$email>}" fpr
+      step "Generating an ed25519 signing key: $uid"
+      fpr=$(gpg --batch --pinentry-mode loopback --passphrase '' --status-fd 1 --quick-gen-key "$uid" ed25519 sign never 2>/dev/null |
+        awk '$2 == "KEY_CREATED" { print $4 }')
+      [[ -n $fpr ]] || die "gpg could not create the key"
+      mkdir -p "$(dirname "$kf")"
+      gpg --batch --armor --export "$fpr" >"$kf"
+      local conf=$SAUR_HOME/saur.conf
+      if grep -q '^SAUR_KEY=' "$conf" 2>/dev/null; then sed -i -E "s/^(SAUR_KEY=)[^[:space:]#]*/\1$fpr/" "$conf"
+      else printf 'SAUR_KEY=%s   # signing key fingerprint (saur key)\n' "$fpr" >>"$conf"; fi
+      SAUR_KEY=$fpr
+      ok "key $(fpr_pretty "$fpr")"
+      info "public key: $kf (commit it), SAUR_KEY set in $conf"
+      info "secret key: in ${GNUPGHOME:-$HOME/.gnupg}; revocation certificate: ${GNUPGHOME:-$HOME/.gnupg}/openpgp-revocs.d/$fpr.rev"
+      info "back it up: gpg --export-secret-keys --armor $fpr > saur-secret.asc (keep it offline)"
+      ((upload)) && cmd_key upload
+      ;;
+    upload)
+      [[ -n $SAUR_KEY ]] || die "no signing key configured (saur key gen)"
+      have gh || die "upload needs the GitHub CLI (gh)"
+      gpg --batch --with-colons --list-secret-keys "$SAUR_KEY" 2>/dev/null | grep -q '^sec' || die "no secret key for $SAUR_KEY in gpg"
+      gpg --batch --armor --export-secret-keys "$SAUR_KEY" | gh secret set SAUR_GPG_KEY -R "$SAUR_GH_REPO"
+      ok "secret SAUR_GPG_KEY set on $SAUR_GH_REPO"
+      ;;
+    *) die "unknown key action: $sub (show|export|gen|upload)" ;;
+  esac
+}
+
+cmd_sign() {
+  local force=0
+  while (($#)); do
+    case $1 in -f|--force) force=1 ;; -h|--help) help_cmd sign; exit 0 ;; *) die "unknown flag: $1" ;; esac
+    shift
+  done
+  [[ -n $SAUR_KEY ]] || die "no signing key configured (saur key gen)"
+  have repo-add || die "sign needs repo-add (pacman) to embed package signatures"
+  SAUR_SIGN=1
+  db_init
+  sign_repo "$force"
+  db_materialize
+  sign_site "$force"
+  ok "signed with $(fpr_pretty "$SAUR_KEY")"
+}
+
+cmd_verify() {
+  JSON=0
+  local all=0
+  while (($#)); do
+    case $1 in --json) JSON=1 ;; -a|--all) all=1 ;; -h|--help) help_cmd verify; exit 0 ;; *) die "unknown flag: $1" ;; esac
+    shift
+  done
+  [[ -n $SAUR_KEY ]] || die "no signing key configured: nothing to verify against"
+  ring_init || die "cannot load the public key ($(key_file))"
+  local rows bad total
+  rows=$(verify_rows)
+  total=$(grep -c . <<<"$rows" || true)
+  bad=$(awk -F'\t' '$3 != "ok"' <<<"$rows" | grep -c . || true)
+  if ((JSON)); then
+    jq -R -s --arg fpr "$SAUR_KEY" '{key: $fpr, files: (split("\n") | map(select(length > 0) | split("\t")
+      | {kind: .[0], file: .[1], status: .[2]}))} | .ok = ([.files[] | select(.status != "ok")] | length == 0)' <<<"$rows"
+  else
+    local shown
+    shown=$(awk -F'\t' -v a="$all" 'a == 1 || $3 != "ok"' <<<"$rows")
+    if [[ -n $shown ]]; then
+      awk -F'\t' -v OFS='\t' -v g="$GRN" -v e="$RED" -v r="$R" '{ print $1, $2, ($3 == "ok" ? g : e) $3 r }' <<<"$shown" |
+        table $'KIND\tFILE\tSTATUS'
+      echo
+    fi
+  fi
+  if ((bad)); then err "$bad of $total file(s) not signed by $(fpr_pretty "$SAUR_KEY")"; return 1; fi
+  ((JSON)) || ok "$total file(s) signed by $(fpr_pretty "$SAUR_KEY")"
+}
+
 cmd_config() {
   local v
   case ${1:-} in
@@ -1476,7 +1985,7 @@ cmd_config() {
 cmd_doctor() {
   local t bad=0
   printf '%sSzmelc AUR · saur %s%s  home: %s\n\n' "$B" "$SAUR_VERSION" "$R" "$SAUR_HOME"
-  for t in git curl jq tar bsdtar makepkg repo-add vercmp gh docker podman python3 darkhttpd systemctl; do
+  for t in git curl jq tar bsdtar makepkg repo-add vercmp gpg gpgv gh docker podman python3 darkhttpd systemctl; do
     if have "$t"; then printf '  %s✓%s %s\n' "$GRN" "$R" "$t"; else printf '  %s·%s %s %s(missing)%s\n' "$YLW" "$R" "$t" "$D" "$R"; fi
   done
   echo
@@ -1485,6 +1994,15 @@ cmd_doctor() {
     err "building needs Arch tools (makepkg, repo-add) or a container engine (docker/podman)"; bad=1
   fi
   [[ -f $SAUR_HOME/saur.conf ]] || warn "no saur.conf in $SAUR_HOME (defaults in use; run: saur init)"
+  if [[ -z $SAUR_KEY ]]; then
+    warn "no signing key: clients get an unsigned repo (SigLevel = Optional TrustAll; create one: saur key gen)"
+  elif [[ ! -f $(key_file) ]]; then
+    err "SAUR_KEY is set but the public key $(key_file) is missing (saur key export > $(key_file))"; bad=1
+  elif [[ -n $SIGNING_KEY_ARMOR ]] || gpg --batch --with-colons --list-secret-keys "$SAUR_KEY" 2>/dev/null | grep -q '^sec'; then
+    ok "signing key $(fpr_pretty "$SAUR_KEY") ready"
+  else
+    warn "signing key $(fpr_pretty "$SAUR_KEY"): public only here, builds stay unsigned (SAUR_GPG_KEY or gpg --import)"
+  fi
   ((bad == 0)) || return 1
   ok "ready"
 }
@@ -1499,9 +2017,11 @@ SAUR_ORG=$SAUR_ORG
 SAUR_ARCH=$SAUR_ARCH
 SAUR_URL=http://$(hostname):$SAUR_PORT
 SAUR_MIRRORS=''
+SAUR_KEY=                           # signing key fingerprint, set by: saur key gen
 EOF
   touch "$SAUR_HOME/repos.extra" "$SAUR_HOME/repos.ignore"
   ok "initialized $SAUR_HOME"
+  info "sign what you publish: saur key gen"
 }
 
 cmd_clean() {
@@ -1525,11 +2045,14 @@ ${B}COMMANDS${R}
   ${ACC}run${R}         scan, build what changed, then generate the site ${D}(what CI and the timer call)${R}
   ${ACC}build${R}       scan and build what changed, update the repo database
   ${ACC}scan${R}        show every source (repo branch) and what would happen to it
-  ${ACC}site${R}        write index.html, packages.json and the one-time add/add-ex scripts
+  ${ACC}site${R}        write index.html, packages.json, feed.xml and the add/add-ex scripts
   ${ACC}list${R}        list packages, stable and experimental
   ${ACC}status${R}      per-source build state and channel
   ${ACC}serve${R}       serve the repository over HTTP
   ${ACC}release${R}     pull|push packages to the GitHub release used as storage
+  ${ACC}key${R}         show|export|gen|upload the signing key
+  ${ACC}sign${R}        sign every package, database and list that lacks a valid signature
+  ${ACC}verify${R}      check every signature against SAUR_KEY
   ${ACC}timer${R}       install|remove|status systemd user units (nightly build + server)
   ${ACC}extra${R}       ls|add|rm repos outside the org
   ${ACC}config${R}      print the effective configuration
@@ -1575,20 +2098,52 @@ ${B}Channels${R}
 EOF
     ;;
     scan) printf '%s\n' "${B}saur scan${R} [--json] [REPO...]" "" "List all sources (one per repo branch) with HEAD, last state and planned action." ;;
-    site) printf '%s\n' "${B}saur site${R}" "" "Write index.html, packages.json, packages.txt and the add/add-ex scripts into SAUR_OUT." \
-      "index.html has Stable / Experimental / All tabs (link one with #stable, #experimental, #all)," \
-      "colored with SAUR_COLOR (stable, default #105c5c) and SAUR_EX_COLOR (experimental, default #750f0f)." ;;
+    site) printf '%s\n' "${B}saur site${R}" "" \
+      "Write index.html, packages.json, packages.txt, feed.xml (Atom, 50 newest builds), key.asc" \
+      "and the add/add-ex scripts into SAUR_OUT. With a signing key, add, add-ex, packages.json and" \
+      "packages.txt get .asc signatures and the add scripts trust that key and require signatures." \
+      "index.html: Stable / Experimental / All tabs (link one with #stable, #experimental, #all)," \
+      "filter (press /), sort, dark theme with a light toggle, links to SAUR_HOMEPAGE and GitHub." \
+      "Colors: SAUR_COLOR (accent, #105c5c), SAUR_EX_COLOR (experimental, #750f0f)," \
+      "SAUR_SILVER (second accent, #c0c0c0), SAUR_AQUA (rare highlight, #7fffd4)." ;;
+    key) cat <<EOF
+${B}saur key${R} [show [--json] | export | gen [-n NAME] [-e EMAIL] [-u] [-f] | upload]
+
+The OpenPGP key that signs packages, databases and the site's lists.
+  show     fingerprint, user id, where the public and secret halves are ${D}(default)${R}
+  export   print the armored public key ${D}(SAUR_KEYFILE, else from gpg)${R}
+  gen      create an ed25519 signing key in your gpg keyring (no passphrase, no expiry),
+           write the public key to SAUR_KEYFILE and SAUR_KEY to saur.conf
+           -n, --name NAME    user id name ${D}(default: Szmelc AUR)${R}
+           -e, --email EMAIL  user id email
+           -u, --upload       also run 'saur key upload'
+           -f, --force        replace an existing SAUR_KEY
+  upload   store the secret key as the GitHub Actions secret SAUR_GPG_KEY on SAUR_GH_REPO
+
+The secret key comes from the gpg keyring or from \$SAUR_GPG_KEY (armored, how CI passes it).
+SAUR_SIGN=auto signs when it is at hand, 1 makes a missing key fatal, 0 turns signing off.
+EOF
+    ;;
+    sign) printf '%s\n' "${B}saur sign${R} [-f|--force]" "" \
+      "Sign every package, database and site list in SAUR_OUT that lacks a valid signature by SAUR_KEY," \
+      "and re-add signed packages so the databases embed their signatures. Builds do this on their own;" \
+      "use it after importing old packages or changing keys (--force re-signs everything). Needs repo-add." ;;
+    verify) printf '%s\n' "${B}saur verify${R} [-a|--all] [--json]" "" \
+      "Check every package, database and site list in SAUR_OUT against SAUR_KEY (public key only)." \
+      "Lists problems (--all: every file) and exits 1 if anything is unsigned or badly signed." ;;
     list) printf '%s\n' "${B}saur list${R} [-s|--stable] [-x|--ex] [-c|--channel stable|experimental|all] [--json]" "" "List packages of both channels (or one)." ;;
     status) printf '%s\n' "${B}saur status${R} [--json]" "" "Show build state and channel per source (repo or repo#branch)." ;;
     serve) printf '%s\n' "${B}saur serve${R} [-p PORT] [-b ADDR]" "" "Serve SAUR_OUT over HTTP (darkhttpd, python3 or busybox)." ;;
-    release) printf '%s\n' "${B}saur release${R} pull|push" "" "pull: download all packages from the GitHub release into SAUR_OUT." "push: upload new packages and the db, delete stale assets. Needs gh." ;;
+    release) printf '%s\n' "${B}saur release${R} pull|push" "" "pull: download all packages from the GitHub release into SAUR_OUT." \
+      "push: upload new packages, signatures and the databases, delete stale assets. Needs gh." \
+      "With SAUR_KEY set, push refuses anything that is not signed by it." ;;
     timer) printf '%s\n' "${B}saur timer${R} install|remove|status [--at CALENDAR] [-p PORT]" "" "Self-hosting: a systemd user timer for 'saur run' (default midnight)" "and a service running 'saur serve'." ;;
     extra) printf '%s\n' "${B}saur extra${R} ls|add|rm [-x|--ex|-s|--stable] [OWNER/REPO[@branch] | URL[@branch]]" "" \
       "Manage repos.extra: repos built in addition to the org." \
       "Without @branch every branch is scanned like an org repo; @branch pins one branch." \
       "--ex / --stable force the channel (a PKGBUILD's _saur_channel still wins)." ;;
     config) printf '%s\n' "${B}saur config${R} [--json]" "" "Print the effective configuration (defaults < saur.conf < saur.local.conf < env)." ;;
-    doctor) printf '%s\n' "${B}saur doctor${R}" "" "Check the tools SAUR needs." ;;
+    doctor) printf '%s\n' "${B}saur doctor${R}" "" "Check the tools SAUR needs and whether the signing key is usable." ;;
     init) printf '%s\n' "${B}saur init${R}" "" "Create saur.conf, repos.extra and repos.ignore in SAUR_HOME." ;;
     clean) printf '%s\n' "${B}saur clean${R} [--all]" "" "Remove clones and logs (--all: the whole work dir, incl. pacman cache)." ;;
     completion) printf '%s\n' "${B}saur completion${R} bash|zsh|fish" "" "Print a completion script. Example: saur completion zsh > ~/.zfunc/_saur" ;;
@@ -1604,7 +2159,7 @@ cmd_completion() {
 _saur() {
   local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[1]}
   if ((COMP_CWORD == 1)); then
-    COMPREPLY=($(compgen -W "run build scan site list status serve release timer extra config doctor init clean completion help version --home --quiet --no-color --version --help" -- "$cur")); return
+    COMPREPLY=($(compgen -W "run build scan site list status serve release key sign verify timer extra config doctor init clean completion help version --home --quiet --no-color --version --help" -- "$cur")); return
   fi
   case $cmd in
     run|build) COMPREPLY=($(compgen -W "--force --retry-failed --dry-run --native --container --help" -- "$cur")) ;;
@@ -1612,11 +2167,14 @@ _saur() {
     scan|status|config) COMPREPLY=($(compgen -W "--json --help" -- "$cur")) ;;
     serve) COMPREPLY=($(compgen -W "--port --bind --help" -- "$cur")) ;;
     release) COMPREPLY=($(compgen -W "pull push" -- "$cur")) ;;
+    key) COMPREPLY=($(compgen -W "show export gen upload --json --name --email --upload --force" -- "$cur")) ;;
+    sign) COMPREPLY=($(compgen -W "--force --help" -- "$cur")) ;;
+    verify) COMPREPLY=($(compgen -W "--all --json --help" -- "$cur")) ;;
     timer) COMPREPLY=($(compgen -W "install remove status --at --port" -- "$cur")) ;;
     extra) COMPREPLY=($(compgen -W "ls add rm --ex --stable" -- "$cur")) ;;
     clean) COMPREPLY=($(compgen -W "--all" -- "$cur")) ;;
     completion) COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
-    help) COMPREPLY=($(compgen -W "run build scan site list status serve release timer extra config doctor init clean completion" -- "$cur")) ;;
+    help) COMPREPLY=($(compgen -W "run build scan site list status serve release key sign verify timer extra config doctor init clean completion" -- "$cur")) ;;
   esac
 }
 complete -F _saur saur
@@ -1635,6 +2193,9 @@ _saur() {
     'status:per-repo build state'
     'serve:serve the repository over HTTP'
     'release:pull or push the GitHub release storage'
+    'key:show, export, generate or upload the signing key'
+    'sign:sign what lacks a valid signature'
+    'verify:check every signature'
     'timer:manage systemd user units'
     'extra:manage repos outside the org'
     'config:print the effective configuration'
@@ -1663,6 +2224,10 @@ _saur() {
         scan|status|config) _arguments '--json[JSON output]' ;;
         serve) _arguments '(-p --port)'{-p,--port}'[port]:port:' '(-b --bind)'{-b,--bind}'[address]:addr:' ;;
         release) _values action pull push ;;
+        key) _arguments '1:action:(show export gen upload)' '--json[JSON output]' '(-n --name)'{-n,--name}'[user id name]:name:' \
+          '(-e --email)'{-e,--email}'[user id email]:email:' '(-u --upload)'{-u,--upload}'[set the GitHub secret]' '(-f --force)'{-f,--force}'[replace the key]' ;;
+        sign) _arguments '(-f --force)'{-f,--force}'[re-sign everything]' ;;
+        verify) _arguments '(-a --all)'{-a,--all}'[list every file]' '--json[JSON output]' ;;
         timer) _arguments '1:action:(install remove status)' '--at[systemd calendar]:calendar:' '(-p --port)'{-p,--port}'[port]:port:' ;;
         extra) _arguments '1:action:(ls add rm)' '(-x --ex)'{-x,--ex}'[experimental channel]' '(-s --stable)'{-s,--stable}'[stable channel]' '*:repo:' ;;
         clean) _arguments '--all[remove the whole work dir]' ;;
@@ -1676,7 +2241,7 @@ EOF
     ;;
     fish) cat <<'EOF'
 # fish completion for saur
-set -l cmds run build scan site list status serve release timer extra config doctor init clean completion help version
+set -l cmds run build scan site list status serve release key sign verify timer extra config doctor init clean completion help version
 complete -c saur -f
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -s H -l home -r -d 'SAUR home'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -s q -l quiet -d 'Only warnings and errors'
@@ -1690,6 +2255,9 @@ complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a list -d 'List pac
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a status -d 'Per-repo build state'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a serve -d 'Serve over HTTP'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a release -d 'GitHub release storage'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a key -d 'Signing key'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a sign -d 'Sign what lacks a signature'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a verify -d 'Check every signature'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a timer -d 'systemd user units'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a extra -d 'Repos outside the org'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a config -d 'Effective configuration'
@@ -1712,6 +2280,15 @@ complete -c saur -n "__fish_seen_subcommand_from extra" -s s -l stable -d 'Stabl
 complete -c saur -n "__fish_seen_subcommand_from serve" -s p -l port -r -d 'Port'
 complete -c saur -n "__fish_seen_subcommand_from serve" -s b -l bind -r -d 'Address'
 complete -c saur -n "__fish_seen_subcommand_from release" -a 'pull push'
+complete -c saur -n "__fish_seen_subcommand_from key" -a 'show export gen upload'
+complete -c saur -n "__fish_seen_subcommand_from key" -l json -d 'JSON output'
+complete -c saur -n "__fish_seen_subcommand_from key" -s n -l name -r -d 'User id name'
+complete -c saur -n "__fish_seen_subcommand_from key" -s e -l email -r -d 'User id email'
+complete -c saur -n "__fish_seen_subcommand_from key" -s u -l upload -d 'Set the GitHub secret'
+complete -c saur -n "__fish_seen_subcommand_from key" -s f -l force -d 'Replace the key'
+complete -c saur -n "__fish_seen_subcommand_from sign" -s f -l force -d 'Re-sign everything'
+complete -c saur -n "__fish_seen_subcommand_from verify" -s a -l all -d 'List every file'
+complete -c saur -n "__fish_seen_subcommand_from verify" -l json -d 'JSON output'
 complete -c saur -n "__fish_seen_subcommand_from timer" -a 'install remove status'
 complete -c saur -n "__fish_seen_subcommand_from extra" -a 'ls add rm'
 complete -c saur -n "__fish_seen_subcommand_from clean" -l all -d 'Remove the whole work dir'
@@ -1727,6 +2304,13 @@ EOF
 # Main
 # ---------------------------------------------------------------------------
 main() {
+  # The armored secret key never stays in the environment: nothing below inherits it.
+  SIGNING_KEY_ARMOR=${SAUR_GPG_KEY:-}
+  if [[ -z $SIGNING_KEY_ARMOR && -n ${SAUR_GPG_KEY_B64:-} ]]; then
+    SIGNING_KEY_ARMOR=$(base64 -d <<<"$SAUR_GPG_KEY_B64" 2>/dev/null || true)
+  fi
+  unset SAUR_GPG_KEY SAUR_GPG_KEY_B64
+  trap sign_cleanup EXIT
   setup_colors
   while (($#)); do
     case $1 in
@@ -1755,6 +2339,9 @@ main() {
     status) cmd_status "$@" ;;
     serve) cmd_serve "$@" ;;
     release) cmd_release "$@" ;;
+    key) cmd_key "$@" ;;
+    sign) cmd_sign "$@" ;;
+    verify) cmd_verify "$@" ;;
     timer) cmd_timer "$@" ;;
     extra) cmd_extra "$@" ;;
     config) cmd_config "$@" ;;

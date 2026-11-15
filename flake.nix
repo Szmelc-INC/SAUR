@@ -12,7 +12,7 @@
       packages = forAll (pkgs: rec {
         saur = pkgs.stdenvNoCC.mkDerivation {
           pname = "saur";
-          version = "0.2.1";
+          version = "0.3.0";
           src = ./.;
           nativeBuildInputs = [ pkgs.makeWrapper pkgs.installShellFiles ];
           dontBuild = true;
@@ -22,7 +22,7 @@
             runHook preInstall
             install -Dm755 bin/saur $out/bin/saur
             wrapProgram $out/bin/saur --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [
-              bash git curl jq gnutar gzip coreutils findutils gawk gnused gnugrep util-linux libarchive
+              bash git curl jq gnutar gzip coreutils findutils gawk gnused gnugrep util-linux libarchive gnupg
             ])}
             installShellCompletion --cmd saur \
               --bash <($out/bin/saur completion bash) \
