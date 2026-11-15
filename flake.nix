@@ -1,5 +1,5 @@
 {
-  description = "SAUR (Szmelc AUR): build, publish and serve a self-updating pacman repository";
+  description = "Szmelc AUR (SAUR): build, publish and serve a self-updating pacman repository with stable and experimental channels";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -12,7 +12,7 @@
       packages = forAll (pkgs: rec {
         saur = pkgs.stdenvNoCC.mkDerivation {
           pname = "saur";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
           nativeBuildInputs = [ pkgs.makeWrapper pkgs.installShellFiles ];
           dontBuild = true;
@@ -32,7 +32,7 @@
             runHook postInstall
           '';
           meta = {
-            description = "Build, publish and serve SAUR, a self-updating pacman repository";
+            description = "Build, publish and serve Szmelc AUR (SAUR), a self-updating pacman repository";
             homepage = "https://szmelc-inc.github.io/SAUR";
             license = pkgs.lib.licenses.mit;
             mainProgram = "saur";

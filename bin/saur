@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# saur - build, publish and serve SAUR (Szmelc AUR), a pacman repository that
-# rebuilds itself from every repo holding a PKGBUILD.
+# saur - build, publish and serve Szmelc AUR (SAUR), a pacman repository that
+# rebuilds itself from every repo and branch holding a PKGBUILD. Two channels:
+# [saur] stable (default branches) and [saur-ex] experimental (other branches,
+# packages renamed foo -> foo-ex so both install side by side).
 #
 # The same script runs in GitHub Actions and on any PC (via docker/podman),
 # so the repository never depends on one hosting provider.
 set -Eeuo pipefail
 shopt -s nullglob
 
-SAUR_VERSION=0.1.0
+SAUR_VERSION=0.2.0
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 # ---------------------------------------------------------------------------
@@ -41,8 +43,9 @@ table() {
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CONFIG_VARS=(SAUR_NAME SAUR_ORG SAUR_ARCH SAUR_URL SAUR_MIRRORS SAUR_GH_REPO SAUR_INCLUDE_FORKS
-  SAUR_INCLUDE_ARCHIVED SAUR_INCLUDE_PRIVATE SAUR_IGNORE_PATHS SAUR_BUILD_TIMEOUT SAUR_NOCHECK
+CONFIG_VARS=(SAUR_NAME SAUR_EX_SUFFIX SAUR_ORG SAUR_ARCH SAUR_URL SAUR_MIRRORS SAUR_GH_REPO SAUR_INCLUDE_FORKS
+  SAUR_INCLUDE_ARCHIVED SAUR_INCLUDE_PRIVATE SAUR_IGNORE_PATHS SAUR_ALL_BRANCHES SAUR_IGNORE_BRANCHES
+  SAUR_BUILD_TIMEOUT SAUR_NOCHECK
   SAUR_IMAGE SAUR_ENGINE SAUR_PACKAGER SAUR_WORK SAUR_OUT SAUR_STATE SAUR_PORT SAUR_JOBS)
 
 resolve_home() {
@@ -58,7 +61,7 @@ load_config() {
   # Defaults < saur.conf < saur.local.conf < environment.
   local envsnap f
   envsnap=$(declare -px | grep -E '^declare -x SAUR_' | sed 's/^declare -x /declare -gx /' || true)
-  SAUR_NAME=saur
+  SAUR_NAME=saur SAUR_EX_SUFFIX=-ex
   SAUR_ORG=Szmelc-INC
   SAUR_ARCH=x86_64
   SAUR_URL=https://szmelc-inc.github.io/SAUR
@@ -66,6 +69,7 @@ load_config() {
   SAUR_GH_REPO=Szmelc-INC/SAUR
   SAUR_INCLUDE_FORKS=0 SAUR_INCLUDE_ARCHIVED=0 SAUR_INCLUDE_PRIVATE=0
   SAUR_IGNORE_PATHS='(^|/)(tests?|testdata|examples?|vendor|node_modules|third_party)/'
+  SAUR_ALL_BRANCHES=1 SAUR_IGNORE_BRANCHES='^(dependabot|renovate)/|^gh-pages$'
   SAUR_BUILD_TIMEOUT=3600 SAUR_NOCHECK=0
   SAUR_IMAGE=docker.io/library/archlinux:base-devel SAUR_ENGINE=
   SAUR_PACKAGER='SAUR <https://github.com/Szmelc-INC/SAUR>'
@@ -77,10 +81,28 @@ load_config() {
   eval "$envsnap"
   abs() { if [[ $1 == /* ]]; then printf '%s' "$1"; else printf '%s/%s' "$SAUR_HOME" "$1"; fi; }
   WORK=$(abs "$SAUR_WORK") OUT=$(abs "$SAUR_OUT") STATEDIR=$(abs "$SAUR_STATE")
-  ARCH=$SAUR_ARCH NAME=$SAUR_NAME
-  REPODIR=$OUT/$ARCH DB=$OUT/$ARCH/$NAME.db.tar.gz
+  ARCH=$SAUR_ARCH REPODIR=$OUT/$ARCH
   STATE=$STATEDIR/$ARCH.tsv LOGS=$WORK/logs
   BUILDER=saurbuild
+  use_channel stable
+}
+
+# Two channels, two pacman repos side by side in one directory:
+#   stable       [saur]     packages as named in their PKGBUILD
+#   experimental [saur-ex]  the same packages renamed foo -> foo-ex (commands too)
+CHANNELS=(stable experimental)
+channel_repo() { if [[ $1 == experimental ]]; then printf '%s' "$SAUR_NAME$SAUR_EX_SUFFIX"; else printf '%s' "$SAUR_NAME"; fi; }
+use_channel() { CHANNEL=$1 NAME=$(channel_repo "$1"); DB=$REPODIR/$NAME.db.tar.gz; }
+channel_of() { # pkgname -> channel, by suffix
+  if [[ -n $SAUR_EX_SUFFIX && $1 == *"$SAUR_EX_SUFFIX" ]]; then echo experimental; else echo stable; fi
+}
+normalize_channel() {
+  case ${1,,} in
+    stable|main|release) echo stable ;;
+    ex|exp|experimental|testing|unstable) echo experimental ;;
+    skip|none|off|no) echo skip ;;
+    *) return 1 ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -120,7 +142,7 @@ untar() { if have bsdtar; then bsdtar -xOf "$1" "$2"; else tar --wildcards -xOzf
 db_records() {
   [[ -f $DB ]] || return 0
   untar "$DB" '*/desc' 2>/dev/null | awk '
-    function flush() { if (n != "") print n "\t" v "\t" d "\t" f "\t" c "\t" b "\t" u "\t" a; n = v = d = f = c = b = u = a = "" }
+    function flush() { if (d == "") d = " "; if (n != "") print n "\t" v "\t" d "\t" f "\t" c "\t" b "\t" u "\t" a; n = v = d = f = c = b = u = a = "" }
     /^%[A-Z0-9]+%$/ { if ($0 == "%FILENAME%") flush(); k = $0; next }
     /^$/ { k = ""; next }
     { gsub(/\t/, " ") }
@@ -131,32 +153,51 @@ db_records() {
 }
 db_version() { db_records | awk -F'\t' -v n="$1" '$1 == n { print $2; exit }'; }
 
+# Records of every channel, prefixed with the channel: channel \t <db_records columns>
+db_records_all() {
+  local ch
+  for ch in "${CHANNELS[@]}"; do
+    use_channel "$ch"
+    db_records | sed "s/^/$ch\t/"
+  done
+  use_channel stable
+}
+
 db_init() {
   mkdir -p "$REPODIR"
-  if [[ ! -f $DB ]]; then
-    tar -czf "$DB" -T /dev/null
-    cp "$DB" "$REPODIR/$NAME.files.tar.gz"
-  fi
-  local base
-  for base in db files; do
-    [[ -e $REPODIR/$NAME.$base ]] || ln -sf "$NAME.$base.tar.gz" "$REPODIR/$NAME.$base"
+  local ch base
+  for ch in "${CHANNELS[@]}"; do
+    use_channel "$ch"
+    if [[ ! -f $DB ]]; then
+      tar -czf "$DB" -T /dev/null
+      cp "$DB" "$REPODIR/$NAME.files.tar.gz"
+    fi
+    for base in db files; do
+      [[ -e $REPODIR/$NAME.$base ]] || ln -sf "$NAME.$base.tar.gz" "$REPODIR/$NAME.$base"
+    done
   done
+  use_channel stable
 }
 
 # Replace the db/files symlinks with real copies (static hosts and release assets need files).
 db_materialize() {
-  local f
-  for f in "$REPODIR/$NAME.db" "$REPODIR/$NAME.files"; do
-    if [[ -L $f ]]; then cp --remove-destination "$(readlink -f "$f")" "$f"; fi
+  local ch f
+  for ch in "${CHANNELS[@]}"; do
+    for f in "$REPODIR/$(channel_repo "$ch")".{db,files}; do
+      if [[ -L $f ]]; then cp --remove-destination "$(readlink -f "$f")" "$f"; fi
+    done
   done
   rm -f "$REPODIR"/*.old
 }
 
-# Delete package files the database no longer references.
+# Every db and files archive, symlinks included (what the release must carry).
+db_files() { local ch; for ch in "${CHANNELS[@]}"; do printf '%s\n' "$REPODIR/$(channel_repo "$ch")".{db,files}{,.tar.gz}; done; }
+
+# Delete package files no database references (both channels share the directory).
 db_gc() {
   local -A keep=()
   local fn f n=0
-  while IFS=$'\t' read -r _ _ _ fn _; do keep[$fn]=1; done < <(db_records)
+  while IFS=$'\t' read -r _ _ _ _ fn _; do keep[$fn]=1; done < <(db_records_all)
   for f in "$REPODIR"/*.pkg.tar.*; do
     fn=${f##*/}; fn=${fn%.sig}
     [[ -n ${keep[$fn]:-} ]] || { rm -f "$f"; n=$((n + 1)); }
@@ -181,9 +222,18 @@ normalize_url() {
   printf '%s' "$u"
 }
 short_id() { local u=${1%.git}; u=${u#https://github.com/}; printf '%s' "$u"; }
-slug() { short_id "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 
-# Output: url \t branch ("-" = remote HEAD; tab is IFS whitespace, so fields are never empty)
+# A source is one branch of one repo. Its state key is the bare URL for the default
+# branch (or an explicitly pinned one) and URL#branch for every other branch.
+source_key() { if (($3)); then printf '%s' "$1"; else printf '%s#%s' "$1" "$2"; fi; } # url branch is_default
+key_url() { printf '%s' "${1%%#*}"; }
+key_is_default() { [[ $1 != *#* ]]; }
+key_id() { if key_is_default "$1"; then short_id "$1"; else printf '%s#%s' "$(short_id "${1%%#*}")" "${1#*#}"; fi; }
+slug() { key_id "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# Output: url \t branch \t channel hint. Branch "-" means every branch of the repo,
+# hint "-" means "let the PKGBUILD and the branch decide" (tab is IFS whitespace,
+# so fields are never empty).
 list_sources() {
   local org=$SAUR_ORG page=1 json n total=0
   local -a lines=()
@@ -198,24 +248,29 @@ list_sources() {
       mapfile -t -O "${#lines[@]}" lines < <(jq -r \
         --argjson forks "$SAUR_INCLUDE_FORKS" --argjson arch "$SAUR_INCLUDE_ARCHIVED" --argjson priv "$SAUR_INCLUDE_PRIVATE" \
         '.[] | select((.fork | not) or $forks == 1) | select((.archived | not) or $arch == 1)
-             | select((.private | not) or $priv == 1) | .clone_url + "\t-"' <<<"$json")
+             | select((.private | not) or $priv == 1) | .clone_url + "\t-\t-"' <<<"$json")
       ((n == 100)) || break
       page=$((page + 1))
     done
     ((total > 0)) || die "no repositories found for '$org' (refusing to continue: that would unpublish everything)"
   fi
-  local line url br
+  local line url br src hint
   if [[ -f $SAUR_HOME/repos.extra ]]; then
     while IFS= read -r line; do
-      line=${line%%#*}; line=$(xargs <<<"$line")
-      [[ -z $line ]] && continue
-      url=$line br=-
-      if [[ $line == git@* ]]; then
-        [[ $line == git@*@* ]] && { url=${line%@*}; br=${line##*@}; }
-      elif [[ $line == *@* ]]; then
-        url=${line%@*} br=${line##*@}
+      line=${line%%#*}
+      src= hint=
+      read -r src hint _ <<<"$line" || true
+      [[ -z $src ]] && continue
+      url=$src br=-
+      if [[ $src == git@* ]]; then
+        [[ $src == git@*@* ]] && { url=${src%@*}; br=${src##*@}; }
+      elif [[ $src == *@* ]]; then
+        url=${src%@*} br=${src##*@}
       fi
-      lines+=("$(normalize_url "$url")"$'\t'"$br")
+      if [[ -n $hint ]]; then
+        hint=$(normalize_channel "$hint") || { warn "repos.extra: unknown channel in '$line', ignored"; hint=-; }
+      fi
+      lines+=("$(normalize_url "$url")"$'\t'"$br"$'\t'"${hint:--}")
     done <"$SAUR_HOME/repos.extra"
   fi
   local -A ignore=() seen=()
@@ -235,16 +290,40 @@ list_sources() {
   done
 }
 
+# One ls-remote per repo lists every branch and which one is the default.
+# Branches that add nothing are dropped here: ignored names, and branches still at
+# the default branch's commit. An unreachable repo yields one row with sha "?".
 _lsremote() {
-  local url=${1%%$'\t'*} br=${1#*$'\t'} ref= sha
-  [[ $br == - ]] || ref=refs/heads/$br
-  sha=$(GIT_TERMINAL_PROMPT=0 timeout 60 git ls-remote "$url" "${ref:-HEAD}" 2>/dev/null | awk 'NR == 1 { print $1 }') || true
-  printf '%s\t%s\t%s\n' "$url" "$br" "${sha:-?}"
+  local url br hint out def defsha sha
+  IFS=$'\t' read -r url br hint <<<"$1"
+  if [[ $br != - ]]; then
+    sha=$(GIT_TERMINAL_PROMPT=0 timeout 60 git ls-remote "$url" "refs/heads/$br" 2>/dev/null | awk 'NR == 1 { print $1 }') || true
+    printf '%s\t%s\t%s\t1\t%s\t%s\n' "$url" "$br" "${sha:-?}" "$hint" "$br"
+    return
+  fi
+  out=$(GIT_TERMINAL_PROMPT=0 timeout 60 git ls-remote --symref "$url" HEAD 'refs/heads/*' 2>/dev/null) || out=
+  def=$(awk '$1 == "ref:" && $3 == "HEAD" { sub("^refs/heads/", "", $2); print $2; exit }' <<<"$out")
+  defsha=$(awk -F'\t' '$2 == "HEAD" && $1 !~ /^ref:/ { print $1; exit }' <<<"$out")
+  if [[ -z $def || -z $defsha ]]; then
+    printf '%s\t-\t?\t1\t%s\t-\n' "$url" "$hint"
+    return
+  fi
+  awk -F'\t' -v OFS='\t' -v url="$url" -v def="$def" -v defsha="$defsha" -v hint="$hint" \
+    -v all="$SAUR_ALL_BRANCHES" -v ign="$SAUR_IGNORE_BRANCHES" '
+    $2 ~ /^refs\/heads\// {
+      b = substr($2, 12); isdef = (b == def)
+      if (!isdef && (all != 1 || $1 == defsha || (ign != "" && b ~ ign))) next
+      print url, b, $1, isdef, hint, def
+    }' <<<"$out"
 }
 export -f _lsremote
 
-# Output: url \t branch \t sha
-resolve_shas() { xargs -d '\n' -r -P "$SAUR_JOBS" -n 1 bash -c '_lsremote "$1"' _ | sort -f; }
+# Output: url \t branch \t sha \t is_default(0|1) \t channel hint \t default branch
+# Default branches sort first, so they claim package names before experiments do.
+resolve_shas() {
+  SAUR_ALL_BRANCHES=$SAUR_ALL_BRANCHES SAUR_IGNORE_BRANCHES=$SAUR_IGNORE_BRANCHES \
+    xargs -d '\n' -r -P "$SAUR_JOBS" -n 1 bash -c '_lsremote "$1"' _ | sort -f -t $'\t' -k4,4r -k1,1 -k2,2
+}
 
 # ---------------------------------------------------------------------------
 # Building
@@ -259,24 +338,217 @@ native_prepare() {
   mkdir -p /etc/makepkg.conf.d
   # Arch enables split debug packages by default; SAUR does not ship them.
   printf 'OPTIONS+=(!debug)\nMAKEFLAGS="-j%s"\n' "$(nproc)" >/etc/makepkg.conf.d/saur.conf
-  # Let packages depend on each other: expose the repo being built to pacman.
-  if ! grep -q "^\[$NAME\]" /etc/pacman.conf; then
-    printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = file://%s\n' "$NAME" "$REPODIR" >>/etc/pacman.conf
-  fi
+  # Let packages depend on each other: expose the repos being built to pacman.
+  local ch repo
+  for ch in "${CHANNELS[@]}"; do
+    repo=$(channel_repo "$ch")
+    if ! grep -q "^\[$repo\]" /etc/pacman.conf; then
+      printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = file://%s\n' "$repo" "$REPODIR" >>/etc/pacman.conf
+    fi
+  done
   pacman -Sy >/dev/null 2>&1 || true
 }
 
 srcinfo_get() { awk -F' = ' -v k="$2" '$1 == "\t" k || $1 == k { print $2 }' <<<"$1"; }
 
-# Build one PKGBUILD directory. Sets BUILT_NAMES. Returns 0 ok, 1 failed, 2 skipped (arch).
+# Channel of one PKGBUILD: its own _saur_channel= wins, then the repos.extra hint,
+# then the branch (default branch -> stable, any other branch -> experimental).
+pkgbuild_channel() { # file is_default hint label
+  local c
+  c=$(sed -nE "s/^[[:space:]]*_saur_channel=[\"']?([A-Za-z]+).*/\1/p" "$1" | tail -n 1)
+  if [[ -n $c ]] && ! c=$(normalize_channel "$c"); then warn "$4: unknown _saur_channel, using the branch default"; c=; fi
+  [[ -n $c || $3 == - ]] || c=$3
+  if [[ -z $c ]]; then if (($2)); then c=stable; else c=experimental; fi; fi
+  printf '%s' "$c"
+}
+
+# Appended to every experimental PKGBUILD. Renames the packages (foo -> foo-ex) and,
+# inside them, commands, man pages, shell completions and desktop entries, so both
+# channels install side by side. The PKGBUILD's own functions still run under the
+# original names, so "$srcdir/$pkgname" or /usr/share/$pkgname keep meaning what the
+# author wrote. Files that still collide with a stable package add a conflicts= entry.
+# A PKGBUILD can opt out with _saur_ex_rename=0 and branch on $SAUR_CHANNEL itself.
+ex_snippet() {
+  cat <<'EOF'
+
+# >>> saur: experimental channel (appended at build time) >>>
+if [[ ${SAUR_CHANNEL:-} == experimental && ${_saur_ex_rename:-1} != 0 ]]; then
+  _saur_sfx=${SAUR_EX_SUFFIX:--ex}
+  _saur_names=("${pkgname[@]}")
+  _saur_base=${pkgbase:-}
+  pkgname=("${pkgname[@]/%/$_saur_sfx}")
+  [[ -z $_saur_base ]] || pkgbase=$_saur_base$_saur_sfx
+  pkgdesc="${pkgdesc:-} [experimental${SAUR_EX_SOURCE:+: $SAUR_EX_SOURCE}]"
+
+  _saur_call() { # function, original pkgnames...
+    local _fn=$1 _sp=("${pkgname[@]}") _sb=${pkgbase:-}
+    shift
+    pkgname=("$@")
+    [[ -z $_saur_base ]] || pkgbase=$_saur_base
+    "$_fn"
+    pkgname=("${_sp[@]}")
+    [[ -z $_saur_base ]] || pkgbase=$_sb
+  }
+  _saur_wrap() { # function, new function name, original pkgnames...
+    declare -F "$1" >/dev/null || return 0
+    eval "_saur_orig_$(declare -f "$1")"
+    local _post=
+    [[ $1 == package* ]] && _post="; _saur_ex_fix $(printf '%q' "$3")"
+    eval "$2() { _saur_call _saur_orig_$1 $(printf '%q ' "${@:3}")$_post; }"
+  }
+  _saur_re() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'; }
+
+  _saur_ex_fix() { # original pkgname
+    local s=$_saur_sfx f n c re t
+    local -a renamed=() hit=()
+    [[ $pkgdesc == *'[experimental'* ]] || pkgdesc="${pkgdesc:-} [experimental${SAUR_EX_SOURCE:+: $SAUR_EX_SOURCE}]"
+    # PKGBUILDs run without nullglob: an unmatched glob comes back as itself.
+    for f in "$pkgdir"/usr/bin/*; do
+      [[ -e $f || -L $f ]] || continue
+      n=${f##*/}
+      [[ $n == *"$s" ]] && continue
+      mv "$f" "$f$s"
+      renamed+=("$n")
+    done
+    for f in "$pkgdir"/usr/share/man/man*/* "$pkgdir"/usr/share/man/*/man*/*; do
+      [[ -e $f || -L $f ]] || continue
+      n=${f##*/}
+      [[ -d $f || ${n%%.*} == *"$s" ]] && continue
+      mv "$f" "${f%/*}/${n%%.*}$s.${n#*.}"
+    done
+    for c in "${renamed[@]}"; do
+      re=$(_saur_re "$c")
+      f=$pkgdir/usr/share/bash-completion/completions/$c
+      # Symlinked completions (aliases) are moved too; only real files are edited.
+      if [[ -f $f || -L $f ]]; then
+        mv "$f" "$f$s"
+        [[ -L $f$s ]] || sed -i -E "/complete /s/([[:space:]])$re([[:space:]]|\$)/\1$c$s\2/g" "$f$s"
+      fi
+      f=$pkgdir/usr/share/zsh/site-functions/_$c
+      if [[ -f $f || -L $f ]]; then
+        mv "$f" "${f%/*}/_$c$s"
+        [[ -L ${f%/*}/_$c$s ]] || sed -i -E "/^#compdef|compdef /s/([[:space:]])$re([[:space:]]|\$)/\1$c$s\2/g" "${f%/*}/_$c$s"
+      fi
+      for f in "$pkgdir"/usr/share/fish/{vendor_completions.d,completions}/"$c".fish; do
+        [[ -f $f || -L $f ]] || continue
+        mv "$f" "${f%/*}/$c$s.fish"
+        [[ -L ${f%/*}/$c$s.fish ]] || sed -i -E "s/(-c|--command)([[:space:]]+)$re([[:space:]]|\$)/\1\2$c$s\3/g" "${f%/*}/$c$s.fish"
+      done
+    done
+    for f in "$pkgdir"/usr/share/applications/*.desktop; do
+      [[ -f $f && $f != *"$s.desktop" ]] || continue
+      for c in "${renamed[@]}"; do
+        re=$(_saur_re "$c")
+        sed -i -E "s/^((Try)?Exec=(.*\/)?)$re([[:space:]]|\$)/\1$c$s\4/" "$f"
+      done
+      sed -i -E 's/^Name=(.*)$/Name=\1 (experimental)/' "$f"
+      mv "$f" "${f%.desktop}$s.desktop"
+    done
+    # Licenses and docs are never read at runtime: give them the package's new name.
+    for f in "$pkgdir"/usr/share/licenses/* "$pkgdir"/usr/share/doc/*; do
+      [[ -e $f || -L $f ]] || continue
+      [[ $f == *"$s" ]] || mv "$f" "$f$s"
+    done
+    # Relative symlinks whose target got renamed above (foo -> foo-ex, x.fish -> x-ex.fish).
+    while IFS= read -r -d '' f; do
+      t=$(readlink "$f")
+      [[ $t == */* || -e ${f%/*}/$t ]] && continue
+      if [[ -e ${f%/*}/$t$s ]]; then ln -sfn "$t$s" "$f"
+      elif [[ $t == *.* && -e ${f%/*}/${t%.*}$s.${t##*.} ]]; then ln -sfn "${t%.*}$s.${t##*.}" "$f"
+      fi
+    done < <(find "$pkgdir" -type l -print0)
+    # Relations inherited from the PKGBUILD would tie foo-ex back to foo: a -git package's
+    # provides=(foo) conflicts=(foo) clashes with the stable build, and replaces= would make
+    # pacman -Syu swap the stable package for the experimental one. Point them at -ex names.
+    local -A own=()
+    for n in "${_saur_names[@]}" ${_saur_base:+"$_saur_base"} "${renamed[@]}"; do
+      own[$n]=1 own[${n%-git}]=1 own[${n%-bin}]=1 own[${n%-nightly}]=1 own[${n%-devel}]=1
+    done
+    _saur_sfx_rel() {
+      local -n _arr=$1
+      local i e nm
+      for i in "${!_arr[@]}"; do
+        e=${_arr[$i]} nm=${_arr[$i]%%[<>=]*}
+        if [[ -n ${own[$nm]:-} ]]; then _arr[$i]=$nm$s${e#"$nm"}; fi
+      done
+    }
+    _saur_sfx_rel provides
+    _saur_sfx_rel conflicts
+    replaces=()
+    if [[ -s ${SAUR_STABLE_FILES:-} ]]; then
+      mapfile -t hit < <(cd "$pkgdir" && find . -mindepth 1 ! -type d -printf '%P\n' |
+        awk -F'\t' 'NR == FNR { own[$2] = own[$2] " " $1; next }
+          ($0 in own) { k = split(own[$0], a, " "); for (i = 1; i <= k; i++) print a[i] }' "$SAUR_STABLE_FILES" - | sort -u)
+      if ((${#hit[@]})); then
+        conflicts+=("${hit[@]}")
+        printf '==> saur: files still clash with stable %s, adding conflicts\n' "${hit[*]}" >&2
+      fi
+    fi
+  }
+
+  for _saur_f in prepare pkgver build check; do _saur_wrap "$_saur_f" "$_saur_f" "${_saur_names[@]}"; done
+  if ((${#_saur_names[@]} == 1)) && ! declare -F "package_${_saur_names[0]}" >/dev/null; then
+    _saur_wrap package package "${_saur_names[0]}"
+  else
+    for _saur_n in "${_saur_names[@]}"; do _saur_wrap "package_$_saur_n" "package_$_saur_n$_saur_sfx" "$_saur_n"; done
+  fi
+fi
+# <<< saur <<<
+EOF
+}
+
+# Files of every stable package (pkgname \t path), for the experimental conflict check.
+stable_files() {
+  local out=$WORK/stable-files.tsv tmp d n
+  tmp=$(mktemp -d)
+  tar -xzf "$REPODIR/$(channel_repo stable).files.tar.gz" -C "$tmp" 2>/dev/null || true
+  for d in "$tmp"/*/; do
+    [[ -f $d/desc && -f $d/files ]] || continue
+    n=$(awk '/^%NAME%$/ { getline; print; exit }' "$d/desc")
+    awk -v n="$n" 'NR > 1 && NF && !/\/$/ { print n "\t" $0 }' "$d/files"
+  done >"$out"
+  rm -rf "$tmp"
+  chmod 644 "$out"
+  printf '%s' "$out"
+}
+
+# Which current source publishes a package name (state key), excluding $2.
+owner_of() {
+  local k
+  for k in "${!ST_PKGS[@]}"; do
+    [[ $k == "${2:-}" ]] && continue
+    if [[ ",${ST_PKGS[$k]}," == *",$1,"* ]]; then printf '%s' "$k"; return 0; fi
+  done
+  return 1
+}
+drop_name() { ST_PKGS[$1]=$(tr ',' '\n' <<<"${ST_PKGS[$1]}" | grep -vxF "$2" | paste -sd, - || true); }
+
+# Unpublish names a source stopped producing, unless another source publishes them.
+unpublish() { # key names...
+  local key=$1 n
+  shift
+  local -a drop=()
+  for n in "$@"; do owner_of "$n" "$key" >/dev/null || drop+=("$n"); done
+  db_remove "${drop[@]}"
+}
+
+# Build one PKGBUILD directory into a channel. Sets BUILT_NAMES.
+# Returns 0 ok, 1 failed, 2 skipped (arch, or every name belongs to another source).
 BUILT_NAMES=()
+EX_SOURCE=
 build_one() {
-  local d=$1 label=$2 log srcinfo
+  local d=$1 label=$2 channel=$3 key=$4 log srcinfo
   BUILT_NAMES=()
+  use_channel "$channel"
   log="$LOGS/$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '_').log"
   : >"$log"
   if ((EUID == 0)); then chown "$BUILDER:" "$log"; fi
-  if ! srcinfo=$(cd "$d" && as_builder makepkg --printsrcinfo 2>>"$log"); then
+  local -a chenv=(SAUR_CHANNEL="$channel" SAUR_EX_SUFFIX="$SAUR_EX_SUFFIX" SAUR_EX_SOURCE="$EX_SOURCE")
+  if [[ $channel == experimental ]]; then
+    ex_snippet >>"$d/PKGBUILD"
+    chenv+=(SAUR_STABLE_FILES="$(stable_files)")
+  fi
+  if ! srcinfo=$(cd "$d" && as_builder env "${chenv[@]}" makepkg --printsrcinfo 2>>"$log"); then
     err "$label: cannot parse PKGBUILD (see $log)"; return 1
   fi
   local -a names arches deps
@@ -323,9 +595,9 @@ build_one() {
   local -a mflags=(-f --noconfirm --noprogressbar)
   ((SAUR_NOCHECK)) && mflags+=(--nocheck)
   ((EUID == 0)) || mflags+=(-s --needed)
-  info "$label: makepkg (${names[*]})"
+  info "$label: makepkg [$NAME] (${names[*]})"
   local rc=0
-  (cd "$d" && as_builder env PKGDEST="$pkgdest" PACKAGER="$SAUR_PACKAGER" \
+  (cd "$d" && as_builder env PKGDEST="$pkgdest" PACKAGER="$SAUR_PACKAGER" "${chenv[@]}" \
     timeout "$SAUR_BUILD_TIMEOUT" makepkg "${mflags[@]}") >>"$log" 2>&1 || rc=$?
   if ((rc)); then
     err "$label: build failed (exit $rc), log: $log"
@@ -334,30 +606,50 @@ build_one() {
   fi
 
   local -a files=()
-  local f n
+  local f n o produced=0
   for f in "$pkgdest"/*.pkg.tar.*; do
     [[ $f == *.sig ]] && continue
     n=${f##*/}; n=${n%-*-*-*}
     [[ " ${names[*]} " == *" $n "* ]] || continue
+    produced=1
+    # One name, one source: a default branch takes a name over from a side branch,
+    # anything else keeps the first source that published it.
+    if o=$(owner_of "$n" "$key"); then
+      if [[ -n ${CURRENT[$o]:-} ]] && ! { key_is_default "$key" && ! key_is_default "$o"; }; then
+        warn "$label: $n is already published by $(key_id "$o"), not replacing it"
+        rm -f "$f"; continue
+      fi
+      drop_name "$o" "$n"
+    fi
     mv -f "$f" "$REPODIR/"
     files+=("$REPODIR/${f##*/}")
     BUILT_NAMES+=("$n")
   done
-  ((${#files[@]})) || { err "$label: makepkg produced no packages"; return 1; }
-  repo-add -q -R "$DB" "${files[@]}" >>"$log" 2>&1 || { err "$label: repo-add failed"; return 1; }
+  ((produced)) || { err "$label: makepkg produced no packages"; use_channel stable; return 1; }
+  ((${#files[@]})) || { use_channel stable; return 2; }
+  if ! repo-add -q -R "$DB" "${files[@]}" >>"$log" 2>&1; then
+    err "$label: repo-add failed"; use_channel stable; return 1
+  fi
   if ((EUID == 0)); then pacman -Sy >/dev/null 2>&1 || true; fi
-  ok "$label: ${files[*]##*/}"
+  ok "$label [$NAME]: ${files[*]##*/}"
+  grep -h '^==> saur:' "$log" | sed "s|^==> saur:|   $label:|" >&2 || true
+  use_channel stable
 }
 
-# Remove packages by name from the database.
+# Remove packages by name from whichever channel database holds them.
 db_remove() {
   (($#)) || return 0
-  local -a present=()
-  local n
-  for n in "$@"; do [[ -n $(db_version "$n") ]] && present+=("$n"); done
-  ((${#present[@]})) || return 0
-  repo-remove -q "$DB" "${present[@]}" >/dev/null 2>&1 || warn "repo-remove failed for ${present[*]}"
-  info "unpublished: ${present[*]}"
+  local ch n
+  local -a present
+  for ch in "${CHANNELS[@]}"; do
+    use_channel "$ch"
+    present=()
+    for n in "$@"; do [[ -n $(db_version "$n") ]] && present+=("$n"); done
+    ((${#present[@]})) || continue
+    repo-remove -q "$DB" "${present[@]}" >/dev/null 2>&1 || warn "repo-remove failed for ${present[*]}"
+    info "unpublished from [$NAME]: ${present[*]}"
+  done
+  use_channel stable
 }
 
 container_engine() {
@@ -398,8 +690,8 @@ in_container() {
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
-matches_filter() { # $1=url, rest=filters
-  local id; id=$(short_id "$1"); id=${id,,}; shift
+matches_filter() { # $1=state key, rest=filters
+  local id; id=$(key_id "$1"); id=${id,,}; shift
   (($#)) || return 0
   local f
   for f in "$@"; do f=${f,,}; [[ $id == "$f" || ${id##*/} == "$f" || $id == *"$f"* ]] && return 0; done
@@ -407,15 +699,15 @@ matches_filter() { # $1=url, rest=filters
 }
 
 # Decide what to do with a source: build | skip
-plan_action() { # url sha
-  local url=$1 sha=$2 n
+plan_action() { # key sha
+  local key=$1 sha=$2 n
   if ((FORCE)); then echo build; return; fi
-  if [[ -z ${ST_SHA[$url]:-} || ${ST_SHA[$url]} != "$sha" ]]; then echo build; return; fi
-  case ${ST_STATUS[$url]} in
+  if [[ -z ${ST_SHA[$key]:-} || ${ST_SHA[$key]} != "$sha" ]]; then echo build; return; fi
+  case ${ST_STATUS[$key]} in
     fail) if ((RETRY_FAILED)); then echo build; else echo skip; fi ;;
     ok)
       # Published packages missing from the db (fresh checkout, lost storage): rebuild.
-      for n in ${ST_PKGS[$url]//,/ }; do [[ -n ${DBVER[$n]:-} ]] || { echo build; return; }; done
+      for n in ${ST_PKGS[$key]//,/ }; do [[ -n ${DBVER[$n]:-} ]] || { echo build; return; }; done
       echo skip ;;
     *) echo skip ;;
   esac
@@ -423,8 +715,12 @@ plan_action() { # url sha
 
 FORCE=0 RETRY_FAILED=0 MODE=auto DRY=0 JSON=0
 FILTERS=()
-declare -A DBVER=()
-load_dbver() { DBVER=(); local n v; while IFS=$'\t' read -r n v _; do [[ -n $n ]] && DBVER[$n]=$v; done < <(db_records); }
+declare -A DBVER=() CURRENT=()
+load_dbver() {
+  DBVER=()
+  local n v
+  while IFS=$'\t' read -r _ n v _; do [[ -n $n ]] && DBVER[$n]=$v; done < <(db_records_all)
+}
 
 parse_build_flags() {
   FILTERS=()
@@ -460,29 +756,43 @@ passthrough_flags() {
   return 0
 }
 
+# Channels a source publishes to, from its package names.
+key_channels() {
+  local n st=0 ex=0
+  for n in ${ST_PKGS[$1]//,/ }; do if [[ $(channel_of "$n") == stable ]]; then st=1; else ex=1; fi; done
+  if ((st && ex)); then echo both; elif ((ex)); then echo experimental; elif ((st)); then echo stable; else echo -; fi
+}
+
 cmd_scan() {
   parse_build_flags "$@"
   state_load; load_dbver
   step "Scanning sources"
-  local rows url br sha
+  local rows url br sha def hint defbr key
   rows=$(list_sources | resolve_shas)
   if ((JSON)); then
-    while IFS=$'\t' read -r url br sha; do
-      matches_filter "$url" "${FILTERS[@]}" || continue
-      jq -nc --arg url "$url" --arg id "$(short_id "$url")" --arg branch "$br" --arg sha "$sha" \
-        --arg status "${ST_STATUS[$url]:-new}" --arg action "$(plan_action "$url" "$sha")" \
-        --arg packages "${ST_PKGS[$url]:-}" \
-        '{id:$id,url:$url,branch:$branch,sha:$sha,status:$status,action:$action,packages:($packages|split(",")|map(select(.!="")))}'
+    while IFS=$'\t' read -r url br sha def hint defbr; do
+      [[ -z $url ]] && continue
+      key=$(source_key "$url" "$br" "$def")
+      matches_filter "$key" "${FILTERS[@]}" || continue
+      jq -nc --arg url "$url" --arg id "$(key_id "$key")" --arg branch "$br" --argjson default "$def" \
+        --arg sha "$sha" --arg hint "$hint" --arg status "${ST_STATUS[$key]:-new}" \
+        --arg action "$(plan_action "$key" "$sha")" --arg packages "${ST_PKGS[$key]:-}" \
+        '{id:$id,url:$url,branch:$branch,default:($default==1),sha:$sha,channel_hint:(if $hint=="-" then null else $hint end),
+          status:$status,action:$action,packages:($packages|split(",")|map(select(.!="")))}'
     done <<<"$rows" | jq -s .
     return
   fi
   local st act c
-  while IFS=$'\t' read -r url br sha; do
-    matches_filter "$url" "${FILTERS[@]}" || continue
-    st=${ST_STATUS[$url]:-new}; act=$(plan_action "$url" "$sha")
+  while IFS=$'\t' read -r url br sha def hint defbr; do
+    [[ -z $url ]] && continue
+    key=$(source_key "$url" "$br" "$def")
+    matches_filter "$key" "${FILTERS[@]}" || continue
+    st=${ST_STATUS[$key]:-new}; act=$(plan_action "$key" "$sha")
     c=$D; [[ $act == build ]] && c=$CYN; [[ $st == fail ]] && c=$RED
-    printf '%s\t%s\t%s\t%s%s%s\t%s\n' "$(short_id "$url")" "${sha:0:10}" "$st" "$c" "$act" "$R" "${ST_PKGS[$url]:-}"
-  done <<<"$rows" | table $'REPO\tSHA\tSTATUS\tACTION\tPACKAGES'
+    printf '%s\t%s%s\t%s\t%s\t%s%s%s\t%s\n' "$(short_id "$url")" "$br" "$( ((def)) && printf ' *')" "${sha:0:10}" "$st" \
+      "$c" "$act" "$R" "${ST_PKGS[$key]:-}"
+  done <<<"$rows" | table $'REPO\tBRANCH\tSHA\tSTATUS\tACTION\tPACKAGES'
+  printf '%s* default branch%s\n' "$D" "$R" >&2
 }
 
 cmd_build() {
@@ -497,92 +807,108 @@ cmd_build() {
   mkdir -p "$WORK/src" "$LOGS"
   db_init; native_prepare; state_load; load_dbver
   if ((EUID == 0)); then chown "$BUILDER:" "$LOGS"; fi
-  local before; before=$(cat "$DB" "$STATE" 2>/dev/null | sha256sum || true)
+  local before; before=$(cat "$REPODIR"/*.db.tar.gz "$STATE" 2>/dev/null | sha256sum || true)
 
   step "Scanning sources"
   local rows; rows=$(list_sources | resolve_shas)
-  local -A current=()
+  CURRENT=()
   local -a todo=()
-  local url br sha
-  while IFS=$'\t' read -r url br sha; do
+  local url br sha def hint defbr key k
+  while IFS=$'\t' read -r url br sha def hint defbr; do
     [[ -z $url ]] && continue
-    current[$url]=1
-    matches_filter "$url" "${FILTERS[@]}" || continue
-    if [[ $sha == '?' ]]; then warn "$(short_id "$url"): unreachable, keeping as is"; continue; fi
-    [[ $(plan_action "$url" "$sha") == build ]] && todo+=("$url"$'\t'"$br")
+    if [[ $sha == '?' ]]; then
+      # Unreachable or empty: keep every branch of it as it is, never unpublish on a hiccup.
+      for k in "${!ST_SHA[@]}"; do [[ $(key_url "$k") == "$url" ]] && CURRENT[$k]=1; done
+      warn "$(short_id "$url"): unreachable, keeping as is"
+      continue
+    fi
+    key=$(source_key "$url" "$br" "$def")
+    CURRENT[$key]=1
+    matches_filter "$key" "${FILTERS[@]}" || continue
+    [[ $(plan_action "$key" "$sha") == build ]] && todo+=("$key"$'\t'"$url"$'\t'"$br"$'\t'"$def"$'\t'"$hint"$'\t'"$defbr")
   done <<<"$rows"
-  info "${#current[@]} sources, ${#todo[@]} to (re)build"
+  info "${#CURRENT[@]} sources (repo branches), ${#todo[@]} to (re)build"
 
-  # Sources that vanished (deleted, archived, ignored): unpublish them.
+  # Sources that vanished (deleted repo or branch, archived, ignored): unpublish them.
   if ((${#FILTERS[@]} == 0)); then
-    for url in "${!ST_SHA[@]}"; do
-      [[ -n ${current[$url]:-} ]] && continue
-      info "$(short_id "$url"): no longer a source"
+    for key in "${!ST_SHA[@]}"; do
+      [[ -n ${CURRENT[$key]:-} ]] && continue
+      info "$(key_id "$key"): no longer a source"
       if ((!DRY)); then
         # shellcheck disable=SC2086
-        db_remove ${ST_PKGS[$url]//,/ }
-        state_del "$url"
+        unpublish "$key" ${ST_PKGS[$key]//,/ }
+        state_del "$key"
       fi
     done
   fi
   if ((DRY)); then
     local i
-    for i in "${todo[@]}"; do printf '  would build: %s\n' "$(short_id "${i%%$'\t'*}")" >&2; done
+    for i in "${todo[@]}"; do printf '  would build: %s\n' "$(key_id "${i%%$'\t'*}")" >&2; done
     return 0
   fi
 
   local -a built=() failed=()
-  local item dir head pkgb label rc id old n
+  local item dir head pkgb label rc id old n ch
   for item in "${todo[@]}"; do
-    url=${item%%$'\t'*} br=${item#*$'\t'}
-    [[ $br == - ]] && br=
-    id=$(short_id "$url")
+    IFS=$'\t' read -r key url br def hint defbr <<<"$item"
+    id=$(key_id "$key")
     step "$id"
-    dir=$WORK/src/$(slug "$url")
+    dir=$WORK/src/$(slug "$key")
     rm -rf "$dir"
-    if ! GIT_TERMINAL_PROMPT=0 git clone -q --filter=blob:none --no-checkout ${br:+--branch "$br"} "$url" "$dir" 2>&1; then
+    if ! GIT_TERMINAL_PROMPT=0 git clone -q --filter=blob:none --no-checkout --branch "$br" "$url" "$dir" 2>&1; then
       err "$id: clone failed"; continue
     fi
     head=$(git -C "$dir" rev-parse HEAD)
-    old=${ST_PKGS[$url]:-}
+    old=${ST_PKGS[$key]:-}
+    # A side branch already merged into the default branch holds nothing new.
+    if ((!def)) && git -C "$dir" merge-base --is-ancestor HEAD "origin/$defbr" 2>/dev/null; then
+      # shellcheck disable=SC2086
+      [[ -n $old ]] && { ST_PKGS[$key]=; unpublish "$key" ${old//,/ }; }
+      state_set "$key" "$head" merged ""
+      rm -rf "$dir"; info "$id: merged into $defbr, nothing to build"; continue
+    fi
     local -a pkgbuilds
     mapfile -t pkgbuilds < <(git -C "$dir" ls-tree -r --name-only HEAD | grep -E '(^|/)PKGBUILD$' | grep -Ev "$SAUR_IGNORE_PATHS" || true)
     if ((${#pkgbuilds[@]} == 0)); then
       # shellcheck disable=SC2086
-      [[ -n $old ]] && db_remove ${old//,/ }
-      state_set "$url" "$head" none ""
+      [[ -n $old ]] && { ST_PKGS[$key]=; unpublish "$key" ${old//,/ }; }
+      state_set "$key" "$head" none ""
       rm -rf "$dir"; info "$id: no PKGBUILD"; continue
     fi
     if ! git -C "$dir" checkout -q 2>&1; then
-      err "$id: checkout failed"; state_set "$url" "$head" fail "$old"; failed+=("$id"); continue
+      err "$id: checkout failed"; state_set "$key" "$head" fail "$old"; failed+=("$id"); continue
     fi
     if [[ -f $dir/.gitmodules ]]; then GIT_TERMINAL_PROMPT=0 git -C "$dir" submodule update -q --init --recursive 2>&1 || true; fi
     if ((EUID == 0)); then chown -R "$BUILDER:" "$dir"; fi
+    EX_SOURCE="$br@${head:0:7}"
     local -a names=()
     local any_fail=0
     for pkgb in "${pkgbuilds[@]}"; do
       label=$id; [[ $pkgb != PKGBUILD ]] && label+=":${pkgb%/PKGBUILD}"
-      rc=0; build_one "$dir/$(dirname "$pkgb")" "$label" || rc=$?
+      ch=$(pkgbuild_channel "$dir/$pkgb" "$def" "$hint" "$label")
+      if [[ $ch == skip ]]; then info "$label: _saur_channel=skip"; continue; fi
+      rc=0; build_one "$dir/$(dirname "$pkgb")" "$label" "$ch" "$key" || rc=$?
+      use_channel stable
       case $rc in
-        0) names+=("${BUILT_NAMES[@]}"); built+=("$label") ;;
+        0) names+=("${BUILT_NAMES[@]}"); built+=("$label [$ch]") ;;
         2) ;;
-        *) any_fail=1; failed+=("$label") ;;
+        *) any_fail=1; failed+=("$label [$ch]") ;;
       esac
     done
     if ((any_fail)); then
-      # Keep whatever was published before; retry when the repo changes.
+      # Keep whatever was published before; retry when the branch changes.
       # shellcheck disable=SC2086
-      state_set "$url" "$head" fail "$(printf '%s\n' ${old//,/ } "${names[@]}" | grep . | sort -u | paste -sd, - || true)"
+      state_set "$key" "$head" fail "$(printf '%s\n' ${old//,/ } "${names[@]}" | grep . | sort -u | paste -sd, - || true)"
     else
-      # Drop packages this repo stopped producing.
+      # Drop packages this source stopped producing.
       local -a gone=()
       for n in ${old//,/ }; do [[ " ${names[*]} " == *" $n "* ]] || gone+=("$n"); done
-      db_remove "${gone[@]}"
       if ((${#names[@]})); then
-        state_set "$url" "$head" ok "$(printf '%s\n' "${names[@]}" | sort -u | paste -sd, -)"
+        state_set "$key" "$head" ok "$(printf '%s\n' "${names[@]}" | sort -u | paste -sd, -)"
       else
-        state_set "$url" "$head" none ""
+        state_set "$key" "$head" none ""
       fi
+      unpublish "$key" "${gone[@]}"
     fi
     state_save
     rm -rf "$dir"
@@ -590,7 +916,7 @@ cmd_build() {
   db_gc
   state_save
 
-  local after; after=$(cat "$DB" "$STATE" 2>/dev/null | sha256sum || true)
+  local after; after=$(cat "$REPODIR"/*.db.tar.gz "$STATE" 2>/dev/null | sha256sum || true)
   local changed=false
   [[ $before != "$after" ]] && changed=true
   echo "$changed" >"$WORK/changed"
@@ -600,8 +926,8 @@ cmd_build() {
   ((${#failed[@]} == 0)) || warn "failed: ${failed[*]}"
   if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
     {
-      echo "### SAUR $ARCH"
-      echo "| result | package source |"; echo "|---|---|"
+      echo "### Szmelc AUR · $ARCH"
+      echo "| result | package source [channel] |"; echo "|---|---|"
       for label in "${built[@]}"; do echo "| ✅ built | \`$label\` |"; done
       for label in "${failed[@]}"; do echo "| ❌ failed | \`$label\` |"; done
       ((${#built[@]} + ${#failed[@]})) || echo "| ➖ | nothing changed |"
@@ -630,68 +956,96 @@ server_lines() {
 
 html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 
-cmd_site() {
-  if [[ ${1:-} == -h || ${1:-} == --help ]]; then help_cmd site; exit 0; fi
-  db_init; db_materialize
-  step "Generating site in $OUT"
-  local recs; recs=$(db_records)
-  jq -R -s --arg arch "$ARCH" 'split("\n") | map(select(length > 0) | split("\t")
-      | {name: .[0], version: .[1], description: .[2], filename: .[3], size: (.[4] | tonumber? // 0),
-         builddate: (.[5] | tonumber? // 0), url: .[6], arch: .[7], download: ($arch + "/" + .[3])})' \
-    <<<"$recs" >"$OUT/packages.json"
-  cut -f1,2 <<<"$recs" | tr '\t' ' ' | grep . >"$OUT/packages.txt" || true
-
-  # One-time setup script: curl -fsSL $SAUR_URL/add | sudo bash
+# One-time setup script: curl -fsSL $SAUR_URL/add | sudo bash  (add-ex: experimental too)
+write_add_script() { # file, experimental by default (0|1)
   {
     cat <<'EOF'
 #!/usr/bin/env bash
-# SAUR one-time setup: adds the repository to /etc/pacman.conf, syncs, says hi once.
+# Szmelc AUR (SAUR) one-time setup: adds the repository to /etc/pacman.conf, syncs, says hi once.
+# Flags: --ex also adds the experimental channel, --stable only the stable one.
 set -euo pipefail
 conf=${PACMAN_CONF:-/etc/pacman.conf}
 EOF
-    printf 'name=%q\n' "$NAME"
+    printf 'name=%q\n' "$(channel_repo stable)"
+    printf 'exname=%q\n' "$(channel_repo experimental)"
     printf 'servers=%q\n' "$(server_lines)"
     printf 'url=%q\n' "$SAUR_URL"
+    printf 'ex=%d\n' "$2"
     cat <<'EOF'
+for a in "$@"; do case $a in -x|--ex|--experimental) ex=1 ;; -s|--stable) ex=0 ;; esac; done
 if [[ $EUID -ne 0 ]]; then
-  echo "SAUR: needs root to edit $conf. Run: curl -fsSL $url/add | sudo bash" >&2
+  echo "Szmelc AUR: needs root to edit $conf. Run: curl -fsSL $url/add | sudo bash" >&2
   exit 1
 fi
-if grep -q "^\[$name\]" "$conf"; then
-  echo "SAUR: [$name] is already in $conf. Nothing to do. (Update with: pacman -Syu)"
-  exit 0
-fi
-cp "$conf" "$conf.saur.bak"
-printf '\n# SAUR (Szmelc AUR): %s\n[%s]\nSigLevel = Optional TrustAll\n%s\n' "$url" "$name" "$servers" >>"$conf"
+want=("$name")
+((ex)) && want+=("$exname")
+added=()
+for r in "${want[@]}"; do
+  if grep -q "^\[$r\]" "$conf"; then echo "Szmelc AUR: [$r] is already in $conf."; continue; fi
+  ((${#added[@]})) || cp "$conf" "$conf.saur.bak"
+  label=stable
+  [[ $r == "$exname" ]] && label='experimental: side branches and work in progress, packages end in -ex'
+  printf '\n# Szmelc AUR (%s): %s\n[%s]\nSigLevel = Optional TrustAll\n%s\n' "$label" "$url" "$r" "$servers" >>"$conf"
+  added+=("$r")
+done
+if ((${#added[@]} == 0)); then echo "Nothing to do. (Update with: pacman -Syu)"; exit 0; fi
 pacman -Syy
 count=$(pacman -Slq "$name" 2>/dev/null | wc -l)
 c=$'\e[1;35m' b=$'\e[1m' d=$'\e[2m' r=$'\e[0m'
 [[ -t 1 && -z ${NO_COLOR:-} ]] || c='' b='' d='' r=''
+if grep -q "^\[$exname\]" "$conf"; then
+  excount=$(pacman -Slq "$exname" 2>/dev/null | wc -l)
+  exline="  ${b}Experimental:${r} [$exname] is on: ${excount} packages named *-ex, safe next to the stable ones."
+else
+  exline="  ${b}Experimental:${r} curl -fsSL $url/add-ex | sudo bash  ${d}(adds [$exname], packages named *-ex)${r}"
+fi
 cat <<MSG
 
-${c}  ▄▀▀ ▄▀▄ █ █ █▀▄   SAUR is in: ${count} Szmelc packages, rebuilt when their code changes.${r}
+${c}  ▄▀▀ ▄▀▄ █ █ █▀▄   Szmelc AUR is in: ${count} Szmelc packages, rebuilt when their code changes.${r}
 ${c}  ▄██ █▀█ ▀▄█ █▀▄${r}   ${d}This message shows once. Plain 'pacman -Syu' keeps them fresh.${r}
 
   ${b}Browse:${r}   pacman -Sl $name
   ${b}Details:${r}  pacman -Si \$(pacman -Slq $name)
   ${b}Pick one:${r} pacman -Slq $name | fzf --preview 'pacman -Si $name/{}' | xargs -ro sudo pacman -S
   ${b}Install:${r}  sudo pacman -S $name/<package>
+$exline
   ${b}Web:${r}      $url
 
 MSG
 EOF
-  } >"$OUT/add"
-  chmod 755 "$OUT/add"
+  } >"$1"
+  chmod 755 "$1"
+}
 
-  local rows='' n v desc fn csz u
+cmd_site() {
+  if [[ ${1:-} == -h || ${1:-} == --help ]]; then help_cmd site; exit 0; fi
+  db_init; db_materialize
+  step "Generating site in $OUT"
+  local recs; recs=$(db_records_all)
+  jq -R -s --arg arch "$ARCH" 'split("\n") | map(select(length > 0) | split("\t")
+      | {name: .[1], version: .[2], description: (.[3] | sub("^ $"; "")), channel: .[0], filename: .[4],
+         size: (.[5] | tonumber? // 0), builddate: (.[6] | tonumber? // 0), url: .[7], arch: .[8],
+         download: ($arch + "/" + .[4])})' \
+    <<<"$recs" >"$OUT/packages.json"
+  local exrepo strepo
+  strepo=$(channel_repo stable) exrepo=$(channel_repo experimental)
+  awk -F'\t' -v s="$strepo" -v x="$exrepo" '{ print ($1 == "stable" ? s : x) "/" $2 " " $3 }' <<<"$recs" | grep . >"$OUT/packages.txt" || true
+
+  write_add_script "$OUT/add" 0
+  write_add_script "$OUT/add-ex" 1
+
+  local rows='' ch n v desc fn csz u
   if [[ -n $recs ]]; then
-    rows=$(while IFS=$'\t' read -r n v desc fn csz _ u _; do
-      printf '<tr><td><a href="%s">%s</a></td><td><code>%s</code></td><td>%s</td><td class="r">%s</td><td><a href="%s/%s" title="download">pkg</a></td></tr>\n' \
-        "$(html_escape <<<"$u")" "$n" "$v" "$(html_escape <<<"$desc")" \
-        "$(numfmt --to=iec "${csz:-0}" 2>/dev/null || echo "$csz")" "$ARCH" "$fn"
+    rows=$(while IFS=$'\t' read -r ch n v desc fn csz _ u _; do
+      printf '<tr data-ch="%s"><td><a href="%s">%s</a></td><td><code>%s</code></td><td><span class="ch %s">%s</span></td><td>%s</td><td class="r">%s</td><td><a href="%s/%s" title="download">pkg</a></td></tr>\n' \
+        "$ch" "$(html_escape <<<"$u")" "$n" "$v" "$ch" "$( [[ $ch == stable ]] && echo "$strepo" || echo "$exrepo")" \
+        "$(html_escape <<<"${desc# }")" "$(numfmt --to=iec "${csz:-0}" 2>/dev/null || echo "$csz")" "$ARCH" "$fn"
     done <<<"$recs")
   fi
-  local count; count=$(grep -c . <<<"$recs" || true)
+  local count st_n ex_n
+  count=$(grep -c . <<<"$recs" || true)
+  st_n=$(grep -c '^stable' <<<"$recs" || true)
+  ex_n=$(grep -c '^experimental' <<<"$recs" || true)
   local updated; updated=$(date -u '+%Y-%m-%d %H:%M UTC')
   cat >"$OUT/index.html" <<EOF
 <!doctype html>
@@ -699,62 +1053,101 @@ EOF
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SAUR · Szmelc AUR</title>
+<title>Szmelc AUR</title>
+<meta name="description" content="Szmelc AUR (SAUR): pacman repository of Szmelc.INC software, rebuilt automatically from git.">
 <style>
-:root { --bg:#fbfaf8; --fg:#1d1b20; --mute:#6b6670; --line:#e6e2dd; --acc:#7a1fd1; --code:#f1eeea; }
-@media (prefers-color-scheme: dark) { :root { --bg:#141216; --fg:#ece8ef; --mute:#9a94a0; --line:#2b2730; --acc:#c08bff; --code:#1f1c23; } }
+:root { --bg:#fbfaf8; --fg:#1d1b20; --mute:#6b6670; --line:#e6e2dd; --acc:#7a1fd1; --code:#f1eeea; --st:#1c7c54; --ex:#b4530a; }
+@media (prefers-color-scheme: dark) { :root { --bg:#141216; --fg:#ece8ef; --mute:#9a94a0; --line:#2b2730; --acc:#c08bff; --code:#1f1c23; --st:#5fd3a0; --ex:#ffae5c; } }
 * { box-sizing: border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 ui-sans-serif,system-ui,sans-serif; }
 main { max-width:980px; margin:0 auto; padding:40px 16px 64px; }
 h1 { font-size:28px; margin:0 0 4px; letter-spacing:-.01em; } h1 span { color:var(--acc); }
-p { color:var(--mute); margin:0 0 20px; }
-pre { background:var(--code); border:1px solid var(--line); border-radius:8px; padding:12px 14px; overflow-x:auto; margin:0 0 28px; }
+h1 small { font-size:15px; color:var(--mute); font-weight:500; }
+p { color:var(--mute); margin:0 0 12px; }
+pre { background:var(--code); border:1px solid var(--line); border-radius:8px; padding:12px 14px; overflow-x:auto; margin:0 0 20px; }
 code, pre { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
-input { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; font:inherit; margin-bottom:12px; }
+.bar { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0 12px; }
+.bar input { flex:1 1 220px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; font:inherit; }
+.bar button { padding:8px 12px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; font:inherit; cursor:pointer; }
+.bar button[aria-pressed="true"] { border-color:var(--acc); color:var(--acc); }
 .wrap { overflow-x:auto; }
 table { width:100%; border-collapse:collapse; }
 th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
 th { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mute); font-weight:600; }
 td.r { text-align:right; white-space:nowrap; color:var(--mute); }
+.ch { font:12px ui-monospace,monospace; white-space:nowrap; }
+.ch.stable { color:var(--st); } .ch.experimental { color:var(--ex); }
 a { color:var(--acc); text-decoration:none; } a:hover { text-decoration:underline; }
 footer { margin-top:28px; color:var(--mute); font-size:13px; }
 </style>
 </head>
 <body>
 <main>
-<h1><span>SAUR</span> · Szmelc AUR</h1>
-<p>${count} packages from Szmelc.INC, rebuilt automatically whenever their source changes. Add it once:</p>
+<h1><span>Szmelc AUR</span> <small>SAUR</small></h1>
+<p>${count} packages from Szmelc.INC, rebuilt automatically whenever their source changes: ${st_n} in <b>[${strepo}]</b> (stable, default branches) and ${ex_n} in <b>[${exrepo}]</b> (experimental, side branches, named <code>*${SAUR_EX_SUFFIX}</code> so they install next to the stable ones).</p>
+<p>Add the stable repo once:</p>
 <pre>curl -fsSL ${SAUR_URL}/add | sudo bash</pre>
+<p>Or stable and experimental together:</p>
+<pre>curl -fsSL ${SAUR_URL}/add-ex | sudo bash</pre>
+<div class="bar">
 <input id="q" type="search" placeholder="Filter packages…" aria-label="Filter packages">
+<button data-f="all" aria-pressed="true">All</button>
+<button data-f="stable" aria-pressed="false">Stable</button>
+<button data-f="experimental" aria-pressed="false">Experimental</button>
+</div>
 <div class="wrap"><table>
-<thead><tr><th>Package</th><th>Version</th><th>Description</th><th class="r">Size</th><th></th></tr></thead>
+<thead><tr><th>Package</th><th>Version</th><th>Repo</th><th>Description</th><th class="r">Size</th><th></th></tr></thead>
 <tbody id="rows">
 ${rows}
 </tbody></table></div>
-<footer>Updated ${updated} · <a href="packages.json">packages.json</a> · <a href="https://github.com/${SAUR_GH_REPO}">source</a></footer>
+<footer>Updated ${updated} · <a href="packages.json">packages.json</a> · <a href="packages.txt">packages.txt</a> · <a href="https://github.com/${SAUR_GH_REPO}">source</a></footer>
 </main>
 <script>
 const q = document.getElementById('q');
-q.addEventListener('input', () => {
+let ch = 'all';
+const apply = () => {
   const s = q.value.toLowerCase();
-  for (const tr of document.querySelectorAll('#rows tr')) tr.hidden = !tr.textContent.toLowerCase().includes(s);
+  for (const tr of document.querySelectorAll('#rows tr'))
+    tr.hidden = !tr.textContent.toLowerCase().includes(s) || (ch !== 'all' && tr.dataset.ch !== ch);
+};
+q.addEventListener('input', apply);
+for (const b of document.querySelectorAll('.bar button')) b.addEventListener('click', () => {
+  ch = b.dataset.f;
+  for (const o of document.querySelectorAll('.bar button')) o.setAttribute('aria-pressed', String(o === b));
+  apply();
 });
 </script>
 </body>
 </html>
 EOF
-  ok "site: $count packages, add script, index.html, packages.json"
+  ok "site: $st_n stable + $ex_n experimental packages, add/add-ex scripts, index.html, packages.json"
 }
 
 cmd_list() {
   JSON=0
-  while (($#)); do case $1 in --json) JSON=1 ;; -h|--help) help_cmd list; exit 0 ;; *) die "unknown flag: $1" ;; esac; shift; done
+  local want=all
+  while (($#)); do
+    case $1 in
+      --json) JSON=1 ;;
+      -c|--channel) want=$2; shift ;;
+      -s|--stable) want=stable ;;
+      -x|--ex|--experimental) want=experimental ;;
+      -h|--help) help_cmd list; exit 0 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+    shift
+  done
+  if [[ $want != all ]]; then want=$(normalize_channel "$want") || die "unknown channel (stable|experimental|all)"; fi
+  [[ -f $DB ]] || die "no database yet at $DB (run: saur run)"
+  local recs; recs=$(db_records_all | awk -F'\t' -v w="$want" 'w == "all" || $1 == w')
   if ((JSON)); then
-    db_records | jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {name: .[0], version: .[1], description: .[2], filename: .[3]})'
+    jq -R -s --arg sfx "$SAUR_EX_SUFFIX" 'split("\n") | map(select(length > 0) | split("\t")
+      | {name: .[1], version: .[2], description: (.[3] | sub("^ $"; "")), filename: .[4], channel: .[0]})' <<<"$recs"
     return
   fi
-  [[ -f $DB ]] || die "no database yet at $DB (run: saur run)"
-  db_records | awk -F'\t' -v OFS='\t' '{ print $1, $2, substr($3, 1, 70) }' | table $'NAME\tVERSION\tDESCRIPTION'
+  awk -F'\t' -v OFS='\t' -v cs="$CYN" -v ce="$YLW" -v r="$R" \
+    '{ print $2, $3, ($1 == "stable" ? cs : ce) $1 r, substr($4, 1, 64) }' <<<"$recs" |
+    grep . | table $'NAME\tVERSION\tCHANNEL\tDESCRIPTION'
 }
 
 cmd_status() {
@@ -764,9 +1157,11 @@ cmd_status() {
   local url
   if ((JSON)); then
     for url in "${!ST_SHA[@]}"; do
-      jq -nc --arg id "$(short_id "$url")" --arg url "$url" --arg sha "${ST_SHA[$url]}" --arg status "${ST_STATUS[$url]}" \
+      jq -nc --arg id "$(key_id "$url")" --arg url "$(key_url "$url")" --arg sha "${ST_SHA[$url]}" --arg status "${ST_STATUS[$url]}" \
+        --arg branch "$(key_is_default "$url" && echo - || echo "${url#*#}")" --arg ch "$(key_channels "$url")" \
         --arg p "${ST_PKGS[$url]}" --argjson t "${ST_TIME[$url]:-0}" \
-        '{id:$id,url:$url,sha:$sha,status:$status,packages:($p|split(",")|map(select(.!=""))),time:$t}'
+        '{id:$id,url:$url,branch:(if $branch=="-" then null else $branch end),channel:(if $ch=="-" then null else $ch end),
+          sha:$sha,status:$status,packages:($p|split(",")|map(select(.!=""))),time:$t}'
     done | jq -s 'sort_by(.id)'
     return
   fi
@@ -774,15 +1169,19 @@ cmd_status() {
   for url in "${!ST_STATUS[@]}"; do
     case ${ST_STATUS[$url]} in ok) ok_n=$((ok_n + 1)) ;; fail) fail_n=$((fail_n + 1)) ;; *) none_n=$((none_n + 1)) ;; esac
   done
-  printf '%sSAUR%s %s  ·  %s%d ok%s  %s%d failed%s  %s%d without PKGBUILD%s  ·  %s packages in db\n\n' \
-    "$B" "$R" "$ARCH" "$GRN" "$ok_n" "$R" "$RED" "$fail_n" "$R" "$D" "$none_n" "$R" "$(db_records | grep -c . || true)"
+  local st_n ex_n
+  st_n=$(db_records_all | grep -c '^stable' || true)
+  ex_n=$(db_records_all | grep -c '^experimental' || true)
+  printf '%sSzmelc AUR%s %s  ·  %s%d ok%s  %s%d failed%s  %s%d idle%s  ·  [%s] %s stable, [%s] %s experimental\n\n' \
+    "$B" "$R" "$ARCH" "$GRN" "$ok_n" "$R" "$RED" "$fail_n" "$R" "$D" "$none_n" "$R" \
+    "$(channel_repo stable)" "$st_n" "$(channel_repo experimental)" "$ex_n"
   local c
   for url in "${!ST_STATUS[@]}"; do
-    [[ ${ST_STATUS[$url]} == none ]] && continue
+    [[ ${ST_STATUS[$url]} == none || ${ST_STATUS[$url]} == merged ]] && continue
     c=$GRN; [[ ${ST_STATUS[$url]} == fail ]] && c=$RED
-    printf '%s\t%s%s%s\t%s\t%s\t%s\n' "$(short_id "$url")" "$c" "${ST_STATUS[$url]}" "$R" "${ST_SHA[$url]:0:10}" \
-      "$(date -d "@${ST_TIME[$url]:-0}" '+%F %H:%M')" "${ST_PKGS[$url]}"
-  done | sort -f | table $'REPO\tSTATUS\tSHA\tCHECKED\tPACKAGES'
+    printf '%s\t%s%s%s\t%s\t%s\t%s\t%s\n' "$(key_id "$url")" "$c" "${ST_STATUS[$url]}" "$R" "$(key_channels "$url")" \
+      "${ST_SHA[$url]:0:10}" "$(date -d "@${ST_TIME[$url]:-0}" '+%F %H:%M')" "${ST_PKGS[$url]}"
+  done | sort -f | table $'SOURCE\tSTATUS\tCHANNEL\tSHA\tCHECKED\tPACKAGES'
 }
 
 cmd_release() {
@@ -802,16 +1201,16 @@ cmd_release() {
       if [[ -f $REPODIR/$NAME-state.tsv ]]; then mkdir -p "$STATEDIR"; mv -f "$REPODIR/$NAME-state.tsv" "$STATE"; fi
       # GitHub stores ':' (epoch) as '.', restore the names pacman expects.
       local fn
-      while IFS=$'\t' read -r _ _ _ fn _; do
+      while IFS=$'\t' read -r _ _ _ _ fn _; do
         if [[ $fn == *:* && ! -f $REPODIR/$fn && -f $REPODIR/${fn//:/.} ]]; then mv "$REPODIR/${fn//:/.}" "$REPODIR/$fn"; fi
-      done < <(db_records)
+      done < <(db_records_all)
       ok "$(find "$REPODIR" -name '*.pkg.tar.*' | wc -l) packages restored"
       ;;
     push)
       db_init; db_materialize
       gh release view "$tag" -R "$repo" >/dev/null 2>&1 ||
-        gh release create "$tag" -R "$repo" --title "SAUR $tag" --latest=false \
-          --notes "Package storage for SAUR ($tag). Add the repo: curl -fsSL $SAUR_URL/add | sudo bash"
+        gh release create "$tag" -R "$repo" --title "Szmelc AUR · $tag" --latest=false \
+          --notes "Package storage for Szmelc AUR (SAUR), $tag: [$NAME] stable and [$(channel_repo experimental)] experimental. Add it: curl -fsSL $SAUR_URL/add | sudo bash"
       step "Syncing release $repo@$tag"
       local -A remote=() local_files=()
       local name size f
@@ -824,7 +1223,8 @@ cmd_release() {
       done
       ((${#up[@]} == 0)) || gh release upload "$tag" -R "$repo" --clobber "${up[@]}"
       # Database last, so the mirror never points at packages it lacks.
-      local -a dbf=("$REPODIR/$NAME".{db,files}{,.tar.gz})
+      local -a dbf
+      mapfile -t dbf < <(db_files)
       for f in "${dbf[@]}"; do local_files[${f##*/}]=1; done
       gh release upload "$tag" -R "$repo" --clobber "${dbf[@]}"
       if [[ -f $STATE ]]; then
@@ -937,16 +1337,30 @@ cmd_extra() {
   case $sub in
     ls|list) if [[ -f $f ]]; then grep -Ev '^\s*(#|$)' "$f" || true; fi ;;
     add)
-      (($#)) || die "usage: saur extra add OWNER/REPO[@branch] | URL[@branch]"
-      for r in "$@"; do
-        if grep -qxF "$r" "$f" 2>/dev/null; then info "already listed: $r"; continue; fi
-        echo "$r" >>"$f"; ok "added $r"
+      local ch= line
+      local -a srcs=()
+      while (($#)); do
+        case $1 in
+          -x|--ex|--experimental) ch=experimental ;;
+          -s|--stable) ch=stable ;;
+          *) srcs+=("$1") ;;
+        esac
+        shift
+      done
+      ((${#srcs[@]})) || die "usage: saur extra add [--ex|--stable] OWNER/REPO[@branch] | URL[@branch]"
+      for r in "${srcs[@]}"; do
+        line=$r${ch:+ $ch}
+        if grep -qE "^[[:space:]]*$(printf '%s' "$r" | sed 's/[][\.*^$+?(){}|/]/\\&/g')([[:space:]]|$)" "$f" 2>/dev/null; then
+          info "already listed: $r"; continue
+        fi
+        echo "$line" >>"$f"; ok "added $line"
       done ;;
     rm|remove)
       (($#)) || die "usage: saur extra rm OWNER/REPO"
       for r in "$@"; do
-        if ! grep -qxF "$r" "$f" 2>/dev/null; then warn "not listed: $r"; continue; fi
-        grep -vxF "$r" "$f" >"$f.tmp" || true; mv "$f.tmp" "$f"; ok "removed $r"
+        local re; re=$(printf '%s' "$r" | sed 's/[][\.*^$+?(){}|/]/\\&/g')
+        if ! grep -qE "^[[:space:]]*$re([[:space:]]|$)" "$f" 2>/dev/null; then warn "not listed: $r"; continue; fi
+        grep -vE "^[[:space:]]*$re([[:space:]]|$)" "$f" >"$f.tmp" || true; mv "$f.tmp" "$f"; ok "removed $r"
       done ;;
     -h|--help) help_cmd extra ;;
     *) die "unknown extra action: $sub (ls|add|rm)" ;;
@@ -966,7 +1380,7 @@ cmd_config() {
 
 cmd_doctor() {
   local t bad=0
-  printf '%sSAUR %s%s  home: %s\n\n' "$B" "$SAUR_VERSION" "$R" "$SAUR_HOME"
+  printf '%sSzmelc AUR · saur %s%s  home: %s\n\n' "$B" "$SAUR_VERSION" "$R" "$SAUR_HOME"
   for t in git curl jq tar bsdtar makepkg repo-add vercmp gh docker podman python3 darkhttpd systemctl; do
     if have "$t"; then printf '  %s✓%s %s\n' "$GRN" "$R" "$t"; else printf '  %s·%s %s %s(missing)%s\n' "$YLW" "$R" "$t" "$D" "$R"; fi
   done
@@ -984,7 +1398,7 @@ cmd_init() {
   mkdir -p "$SAUR_HOME"
   if [[ -f $SAUR_HOME/saur.conf ]]; then info "$SAUR_HOME/saur.conf exists"; return 0; fi
   cat >"$SAUR_HOME/saur.conf" <<EOF
-# SAUR configuration (bash). Overrides: saur.local.conf, then SAUR_* env vars.
+# Szmelc AUR (SAUR) configuration (bash). Overrides: saur.local.conf, then SAUR_* env vars.
 SAUR_NAME=$SAUR_NAME
 SAUR_ORG=$SAUR_ORG
 SAUR_ARCH=$SAUR_ARCH
@@ -1007,7 +1421,7 @@ cmd_clean() {
 # ---------------------------------------------------------------------------
 usage() {
   cat <<EOF
-${B}saur${R} ${D}$SAUR_VERSION${R} · build, publish and serve SAUR (Szmelc AUR)
+${B}saur${R} ${D}$SAUR_VERSION${R} · build, publish and serve Szmelc AUR (SAUR)
 
 ${B}USAGE${R}
   saur [global flags] <command> [flags]
@@ -1015,10 +1429,10 @@ ${B}USAGE${R}
 ${B}COMMANDS${R}
   ${CYN}run${R}         scan, build what changed, then generate the site ${D}(what CI and the timer call)${R}
   ${CYN}build${R}       scan and build what changed, update the repo database
-  ${CYN}scan${R}        show every source repo and what would happen to it
-  ${CYN}site${R}        write index.html, packages.json and the one-time 'add' script
-  ${CYN}list${R}        list packages in the repository
-  ${CYN}status${R}      per-repo build state (ok / failed / no PKGBUILD)
+  ${CYN}scan${R}        show every source (repo branch) and what would happen to it
+  ${CYN}site${R}        write index.html, packages.json and the one-time add/add-ex scripts
+  ${CYN}list${R}        list packages, stable and experimental
+  ${CYN}status${R}      per-source build state and channel
   ${CYN}serve${R}       serve the repository over HTTP
   ${CYN}release${R}     pull|push packages to the GitHub release used as storage
   ${CYN}timer${R}       install|remove|status systemd user units (nightly build + server)
@@ -1043,27 +1457,39 @@ help_cmd() {
     run|build) cat <<EOF
 ${B}saur $1${R} [flags] [REPO...]
 
-Scan the org (and repos.extra), clone each repo whose HEAD moved, build every
-PKGBUILD it holds and update the database. Failures are isolated per package and
-retried only when the repo changes. ${B}run${R} also regenerates the site.
+Scan every branch of every repo in the org (and repos.extra), clone each branch
+whose HEAD moved, build every PKGBUILD it holds and update the databases.
+Failures are isolated per package and retried only when the branch changes.
+${B}run${R} also regenerates the site.
 Without --native this runs inside an Arch container (docker/podman).
+
+${B}Channels${R}
+  stable        [$(channel_repo stable)]   default branch
+  experimental  [$(channel_repo experimental)]  any other branch; packages, commands, man pages and
+                completions get the suffix '$SAUR_EX_SUFFIX' (foo -> foo$SAUR_EX_SUFFIX)
+  A PKGBUILD overrides this with ${B}_saur_channel=stable|experimental|skip${R}, sees
+  ${B}\$SAUR_CHANNEL${R} while building, and can turn the renaming off with ${B}_saur_ex_rename=0${R}.
+  Branches merged into the default one, or matching SAUR_IGNORE_BRANCHES, are skipped.
 
   -f, --force         rebuild everything (or every matched REPO)
   -r, --retry-failed  retry failed packages even if unchanged
   -n, --dry-run       only print what would be built
       --native        build on this machine (Arch, as root: CI/containers)
       --container     always use a container
-  REPO                limit to matching repos (name, owner/name or substring)
+  REPO                limit to matching sources (name, owner/name, owner/name#branch or substring)
 EOF
     ;;
-    scan) printf '%s\n' "${B}saur scan${R} [--json] [REPO...]" "" "List all sources with their HEAD, last state and planned action." ;;
-    site) printf '%s\n' "${B}saur site${R}" "" "Write index.html, packages.json, packages.txt and the 'add' script into SAUR_OUT." ;;
-    list) printf '%s\n' "${B}saur list${R} [--json]" "" "List packages in the repository database." ;;
-    status) printf '%s\n' "${B}saur status${R} [--json]" "" "Show build state per source repo." ;;
+    scan) printf '%s\n' "${B}saur scan${R} [--json] [REPO...]" "" "List all sources (one per repo branch) with HEAD, last state and planned action." ;;
+    site) printf '%s\n' "${B}saur site${R}" "" "Write index.html, packages.json, packages.txt and the add/add-ex scripts into SAUR_OUT." ;;
+    list) printf '%s\n' "${B}saur list${R} [-s|--stable] [-x|--ex] [-c|--channel stable|experimental|all] [--json]" "" "List packages of both channels (or one)." ;;
+    status) printf '%s\n' "${B}saur status${R} [--json]" "" "Show build state and channel per source (repo or repo#branch)." ;;
     serve) printf '%s\n' "${B}saur serve${R} [-p PORT] [-b ADDR]" "" "Serve SAUR_OUT over HTTP (darkhttpd, python3 or busybox)." ;;
     release) printf '%s\n' "${B}saur release${R} pull|push" "" "pull: download all packages from the GitHub release into SAUR_OUT." "push: upload new packages and the db, delete stale assets. Needs gh." ;;
     timer) printf '%s\n' "${B}saur timer${R} install|remove|status [--at CALENDAR] [-p PORT]" "" "Self-hosting: a systemd user timer for 'saur run' (default midnight)" "and a service running 'saur serve'." ;;
-    extra) printf '%s\n' "${B}saur extra${R} ls|add|rm [OWNER/REPO[@branch] | URL[@branch]]" "" "Manage repos.extra: repos built in addition to the org." ;;
+    extra) printf '%s\n' "${B}saur extra${R} ls|add|rm [-x|--ex|-s|--stable] [OWNER/REPO[@branch] | URL[@branch]]" "" \
+      "Manage repos.extra: repos built in addition to the org." \
+      "Without @branch every branch is scanned like an org repo; @branch pins one branch." \
+      "--ex / --stable force the channel (a PKGBUILD's _saur_channel still wins)." ;;
     config) printf '%s\n' "${B}saur config${R} [--json]" "" "Print the effective configuration (defaults < saur.conf < saur.local.conf < env)." ;;
     doctor) printf '%s\n' "${B}saur doctor${R}" "" "Check the tools SAUR needs." ;;
     init) printf '%s\n' "${B}saur init${R}" "" "Create saur.conf, repos.extra and repos.ignore in SAUR_HOME." ;;
@@ -1085,11 +1511,12 @@ _saur() {
   fi
   case $cmd in
     run|build) COMPREPLY=($(compgen -W "--force --retry-failed --dry-run --native --container --help" -- "$cur")) ;;
-    scan|list|status|config) COMPREPLY=($(compgen -W "--json --help" -- "$cur")) ;;
+    list) COMPREPLY=($(compgen -W "--json --stable --ex --channel --help stable experimental all" -- "$cur")) ;;
+    scan|status|config) COMPREPLY=($(compgen -W "--json --help" -- "$cur")) ;;
     serve) COMPREPLY=($(compgen -W "--port --bind --help" -- "$cur")) ;;
     release) COMPREPLY=($(compgen -W "pull push" -- "$cur")) ;;
     timer) COMPREPLY=($(compgen -W "install remove status --at --port" -- "$cur")) ;;
-    extra) COMPREPLY=($(compgen -W "ls add rm" -- "$cur")) ;;
+    extra) COMPREPLY=($(compgen -W "ls add rm --ex --stable" -- "$cur")) ;;
     clean) COMPREPLY=($(compgen -W "--all" -- "$cur")) ;;
     completion) COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
     help) COMPREPLY=($(compgen -W "run build scan site list status serve release timer extra config doctor init clean completion" -- "$cur")) ;;
@@ -1107,7 +1534,7 @@ _saur() {
     'build:scan and build what changed'
     'scan:show sources and planned actions'
     'site:generate index.html, packages.json and the add script'
-    'list:list packages in the repository'
+    'list:list packages, stable and experimental'
     'status:per-repo build state'
     'serve:serve the repository over HTTP'
     'release:pull or push the GitHub release storage'
@@ -1134,11 +1561,13 @@ _saur() {
       case $words[1] in
         run|build) _arguments '(-f --force)'{-f,--force}'[rebuild everything]' '(-r --retry-failed)'{-r,--retry-failed}'[retry failed]' \
           '(-n --dry-run)'{-n,--dry-run}'[only print the plan]' '--native[build on this machine]' '--container[use a container]' '*:repo:' ;;
-        scan|list|status|config) _arguments '--json[JSON output]' ;;
+        list) _arguments '--json[JSON output]' '(-s --stable)'{-s,--stable}'[stable only]' '(-x --ex)'{-x,--ex}'[experimental only]' \
+          '(-c --channel)'{-c,--channel}'[channel]:channel:(stable experimental all)' ;;
+        scan|status|config) _arguments '--json[JSON output]' ;;
         serve) _arguments '(-p --port)'{-p,--port}'[port]:port:' '(-b --bind)'{-b,--bind}'[address]:addr:' ;;
         release) _values action pull push ;;
         timer) _arguments '1:action:(install remove status)' '--at[systemd calendar]:calendar:' '(-p --port)'{-p,--port}'[port]:port:' ;;
-        extra) _arguments '1:action:(ls add rm)' '*:repo:' ;;
+        extra) _arguments '1:action:(ls add rm)' '(-x --ex)'{-x,--ex}'[experimental channel]' '(-s --stable)'{-s,--stable}'[stable channel]' '*:repo:' ;;
         clean) _arguments '--all[remove the whole work dir]' ;;
         completion) _values shell bash zsh fish ;;
         help) _describe command cmds ;;
@@ -1160,7 +1589,7 @@ complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a run -d 'Scan, bui
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a build -d 'Scan and build what changed'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a scan -d 'Show sources and planned actions'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a site -d 'Generate site files'
-complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a list -d 'List packages'
+complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a list -d 'List packages (both channels)'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a status -d 'Per-repo build state'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a serve -d 'Serve over HTTP'
 complete -c saur -n "not __fish_seen_subcommand_from $cmds" -a release -d 'GitHub release storage'
@@ -1178,6 +1607,11 @@ complete -c saur -n "__fish_seen_subcommand_from run build" -s n -l dry-run -d '
 complete -c saur -n "__fish_seen_subcommand_from run build" -l native -d 'Build on this machine'
 complete -c saur -n "__fish_seen_subcommand_from run build" -l container -d 'Use a container'
 complete -c saur -n "__fish_seen_subcommand_from scan list status config" -l json -d 'JSON output'
+complete -c saur -n "__fish_seen_subcommand_from list" -s s -l stable -d 'Stable only'
+complete -c saur -n "__fish_seen_subcommand_from list" -s x -l ex -d 'Experimental only'
+complete -c saur -n "__fish_seen_subcommand_from list" -s c -l channel -x -a 'stable experimental all' -d 'Channel'
+complete -c saur -n "__fish_seen_subcommand_from extra" -s x -l ex -d 'Experimental channel'
+complete -c saur -n "__fish_seen_subcommand_from extra" -s s -l stable -d 'Stable channel'
 complete -c saur -n "__fish_seen_subcommand_from serve" -s p -l port -r -d 'Port'
 complete -c saur -n "__fish_seen_subcommand_from serve" -s b -l bind -r -d 'Address'
 complete -c saur -n "__fish_seen_subcommand_from release" -a 'pull push'
