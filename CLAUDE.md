@@ -20,9 +20,9 @@ If you see a better solution than the one asked for, implement the better one. T
 
 ## Brand
 
-- Szmelc dirty cyan `#105c5c` is the brand and stable color (`SAUR_COLOR`).
+- Szmelc dirty cyan `#105c5c` is the main accent of every design here: site (`SAUR_COLOR`), CLI output, the add-script welcome. No purple, no default accents.
 - Dark red `#750f0f` marks experimental (`SAUR_EX_COLOR`).
-- Both colors are dark. Use them as fills with white text. On a dark background, tint them toward white for text.
+- Both colors are dark. Use them as fills with white text. On a dark background, tint them toward white for text. The CLI uses `#1f8a8a` and `#b83a3a` in 24-bit mode, and plain cyan and red otherwise.
 
 ## Local testing
 

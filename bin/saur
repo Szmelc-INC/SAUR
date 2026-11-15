@@ -18,8 +18,15 @@ SELF=$(readlink -f "${BASH_SOURCE[0]}")
 setup_colors() {
   if [[ -z ${NO_COLOR:-} && ${SAUR_NO_COLOR:-0} != 1 ]] && { [[ -t 1 ]] || [[ -n ${GITHUB_ACTIONS:-} ]]; }; then
     B=$'\e[1m' D=$'\e[90m' R=$'\e[0m' RED=$'\e[31m' GRN=$'\e[32m' YLW=$'\e[33m' BLU=$'\e[34m' MAG=$'\e[35m' CYN=$'\e[36m'
+    # Brand accents: Szmelc dirty cyan (#105c5c) and experimental red (#750f0f), lifted so they
+    # read on dark and light terminals. 16-color terminals get plain cyan and red.
+    if [[ ${COLORTERM:-} == *truecolor* || ${COLORTERM:-} == *24bit* || -n ${GITHUB_ACTIONS:-} ]]; then
+      ACC=$'\e[38;2;31;138;138m' EXC=$'\e[38;2;184;58;58m'
+    else
+      ACC=$CYN EXC=$RED
+    fi
   else
-    B='' D='' R='' RED='' GRN='' YLW='' BLU='' MAG='' CYN=''
+    B='' D='' R='' RED='' GRN='' YLW='' BLU='' MAG='' CYN='' ACC='' EXC=''
   fi
 }
 QUIET=0
@@ -28,7 +35,7 @@ ok()   { ((QUIET)) || printf '%s ✓%s %s\n' "$GRN" "$R" "$*" >&2; }
 warn() { printf '%s !!%s %s\n' "$YLW" "$R" "$*" >&2; }
 err()  { printf '%s ✗%s %s\n' "$RED" "$R" "$*" >&2; }
 die()  { err "$*"; exit 1; }
-step() { ((QUIET)) || printf '\n%s==>%s %s%s%s\n' "$MAG" "$R" "$B" "$*" "$R" >&2; }
+step() { ((QUIET)) || printf '\n%s==>%s %s%s%s\n' "$ACC" "$R" "$B" "$*" "$R" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 group()    { if [[ -n ${GITHUB_ACTIONS:-} ]]; then echo "::group::$*" >&2; fi; }
 endgroup() { if [[ -n ${GITHUB_ACTIONS:-} ]]; then echo "::endgroup::" >&2; fi; }
@@ -789,7 +796,7 @@ cmd_scan() {
     key=$(source_key "$url" "$br" "$def")
     matches_filter "$key" "${FILTERS[@]}" || continue
     st=${ST_STATUS[$key]:-new}; act=$(plan_action "$key" "$sha")
-    c=$D; [[ $act == build ]] && c=$CYN; [[ $st == fail ]] && c=$RED
+    c=$D; [[ $act == build ]] && c=$ACC; [[ $st == fail ]] && c=$RED
     printf '%s\t%s%s\t%s\t%s\t%s%s%s\t%s\n' "$(short_id "$url")" "$br" "$( ((def)) && printf ' *')" "${sha:0:10}" "$st" \
       "$c" "$act" "$R" "${ST_PKGS[$key]:-}"
   done <<<"$rows" | table $'REPO\tBRANCH\tSHA\tSTATUS\tACTION\tPACKAGES'
@@ -992,7 +999,7 @@ done
 if ((${#added[@]} == 0)); then echo "Nothing to do. (Update with: pacman -Syu)"; exit 0; fi
 pacman -Syy
 count=$(pacman -Slq "$name" 2>/dev/null | wc -l)
-c=$'\e[1;35m' b=$'\e[1m' d=$'\e[2m' r=$'\e[0m'
+c=$'\e[1;38;2;31;138;138m' b=$'\e[1m' d=$'\e[2m' r=$'\e[0m'
 [[ -t 1 && -z ${NO_COLOR:-} ]] || c='' b='' d='' r=''
 if grep -q "^\[$exname\]" "$conf"; then
   excount=$(pacman -Slq "$exname" 2>/dev/null | wc -l)
@@ -1233,7 +1240,7 @@ cmd_list() {
       | {name: .[1], version: .[2], description: (.[3] | sub("^ $"; "")), filename: .[4], channel: .[0]})' <<<"$recs"
     return
   fi
-  awk -F'\t' -v OFS='\t' -v cs="$CYN" -v ce="$YLW" -v r="$R" \
+  awk -F'\t' -v OFS='\t' -v cs="$ACC" -v ce="$EXC" -v r="$R" \
     '{ print $2, $3, ($1 == "stable" ? cs : ce) $1 r, substr($4, 1, 64) }' <<<"$recs" |
     grep . | table $'NAME\tVERSION\tCHANNEL\tDESCRIPTION'
 }
@@ -1515,21 +1522,21 @@ ${B}USAGE${R}
   saur [global flags] <command> [flags]
 
 ${B}COMMANDS${R}
-  ${CYN}run${R}         scan, build what changed, then generate the site ${D}(what CI and the timer call)${R}
-  ${CYN}build${R}       scan and build what changed, update the repo database
-  ${CYN}scan${R}        show every source (repo branch) and what would happen to it
-  ${CYN}site${R}        write index.html, packages.json and the one-time add/add-ex scripts
-  ${CYN}list${R}        list packages, stable and experimental
-  ${CYN}status${R}      per-source build state and channel
-  ${CYN}serve${R}       serve the repository over HTTP
-  ${CYN}release${R}     pull|push packages to the GitHub release used as storage
-  ${CYN}timer${R}       install|remove|status systemd user units (nightly build + server)
-  ${CYN}extra${R}       ls|add|rm repos outside the org
-  ${CYN}config${R}      print the effective configuration
-  ${CYN}doctor${R}      check required tools
-  ${CYN}init${R}        create a config for a self-hosted instance
-  ${CYN}clean${R}       remove build leftovers
-  ${CYN}completion${R}  print shell completion (bash|zsh|fish)
+  ${ACC}run${R}         scan, build what changed, then generate the site ${D}(what CI and the timer call)${R}
+  ${ACC}build${R}       scan and build what changed, update the repo database
+  ${ACC}scan${R}        show every source (repo branch) and what would happen to it
+  ${ACC}site${R}        write index.html, packages.json and the one-time add/add-ex scripts
+  ${ACC}list${R}        list packages, stable and experimental
+  ${ACC}status${R}      per-source build state and channel
+  ${ACC}serve${R}       serve the repository over HTTP
+  ${ACC}release${R}     pull|push packages to the GitHub release used as storage
+  ${ACC}timer${R}       install|remove|status systemd user units (nightly build + server)
+  ${ACC}extra${R}       ls|add|rm repos outside the org
+  ${ACC}config${R}      print the effective configuration
+  ${ACC}doctor${R}      check required tools
+  ${ACC}init${R}        create a config for a self-hosted instance
+  ${ACC}clean${R}       remove build leftovers
+  ${ACC}completion${R}  print shell completion (bash|zsh|fish)
 
 ${B}GLOBAL FLAGS${R}
   -H, --home DIR   SAUR home (config, state, output)  ${D}[\$SAUR_HOME]${R}
