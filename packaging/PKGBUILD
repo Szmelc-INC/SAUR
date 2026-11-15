@@ -3,7 +3,7 @@
 # Packages the Szmelc AUR (SAUR) tool from the checkout this PKGBUILD lives in, so SAUR
 # publishes itself: cd packaging && makepkg -si
 pkgname=saur
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc="Build, publish and serve Szmelc AUR (SAUR): a self-updating, signed pacman repository with stable and experimental channels"
 arch=('any')

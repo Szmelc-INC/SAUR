@@ -10,7 +10,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-SAUR_VERSION=0.3.0
+SAUR_VERSION=0.3.1
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 # ---------------------------------------------------------------------------
@@ -1679,7 +1679,7 @@ cmd_release() {
         if [[ ! -f $REPODIR/$fn && -f $REPODIR/${fn//:/.} ]]; then mv "$REPODIR/${fn//:/.}" "$REPODIR/$fn"; fi
         if [[ ! -f $REPODIR/$fn.sig && -f $REPODIR/${fn//:/.}.sig ]]; then mv "$REPODIR/${fn//:/.}.sig" "$REPODIR/$fn.sig"; fi
       done < <(db_records_all)
-      ok "$(find "$REPODIR" -name '*.pkg.tar.*' | wc -l) packages restored"
+      ok "$(find "$REPODIR" -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) packages restored"
       ;;
     push)
       db_init; db_materialize
@@ -1910,7 +1910,7 @@ cmd_key() {
       mkdir -p "$(dirname "$kf")"
       gpg --batch --armor --export "$fpr" >"$kf"
       local conf=$SAUR_HOME/saur.conf
-      if grep -q '^SAUR_KEY=' "$conf" 2>/dev/null; then sed -i -E "s/^(SAUR_KEY=)[^[:space:]#]*/\1$fpr/" "$conf"
+      if grep -q '^SAUR_KEY=' "$conf" 2>/dev/null; then sed -i -E -e "s/^SAUR_KEY=[^[:space:]#]*[[:space:]]*(#|$)/SAUR_KEY=$fpr   \1/" -e '/^SAUR_KEY=/s/[[:space:]]+$//' "$conf"
       else printf 'SAUR_KEY=%s   # signing key fingerprint (saur key)\n' "$fpr" >>"$conf"; fi
       SAUR_KEY=$fpr
       ok "key $(fpr_pretty "$fpr")"
