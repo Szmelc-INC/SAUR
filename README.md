@@ -1,5 +1,9 @@
 # Szmelc AUR
 
+### [SAUR](https://szmelc-inc.github.io/SAUR/) ~ Live WebUI on GitHub via Deployments on `github-pages`
+<img width="1920" height="1030" alt="image" src="https://github.com/user-attachments/assets/1adcfb2d-ca1f-4d59-874c-c31c441d6c2f" />
+
+
 **SAUR** for short: the pacman repository of everything Szmelc.INC builds, rebuilt automatically from git.
 
 ```sh
